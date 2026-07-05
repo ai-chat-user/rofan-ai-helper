@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Rofan AI Helper",
+  "description": "Rofan AI 도우미",
+  "version": "0.20.0",
+  "permissions": [
+    "storage",
+    "clipboardWrite",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "https://rofan.ai/*",
+    "https://www.rofan.ai/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://rofan.ai/*",
+        "https://www.rofan.ai/*"
+      ],
+      "js": [
+        "src/page-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://rofan.ai/*",
+        "https://www.rofan.ai/*"
+      ],
+      "js": [
+        "src/content.js"
+      ],
+      "css": [
+        "src/styles.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
