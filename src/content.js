@@ -40,6 +40,29 @@
       chatInput: { fixedEnabled: false, fixedText: "" },
       // /단축어 치환: enabled + [{trigger, content}] 목록. showChips = 입력창에 [/명령어] 칩 표시.
       shortcuts: { enabled: false, showChips: true, list: [] },
+      // NAI 이미지 생성 연동
+      nai: {
+        enabled: false,
+        imgProvider: "nai", // nai | gpt | gemini | grok
+        aiProvider: "gemini", // gemini | deepseek | openai | grok | claude
+        aiCfg: {}, // 제공사별 { key, model } 저장
+        aiKey: "",   // (구버전 호환)
+        aiModel: "", // (구버전 호환)
+        naiKey: "",
+        templates: [null, null, null, null], // 그림체 1~4
+        activeTemplate: 0,
+        // 서비스별 이미지 생성 설정 (gpt/gemini/grok)
+        imgCfg: {
+          gpt: { model: "", size: "1024x1536", prompt: "" },
+          gemini: { model: "", prompt: "" },
+          grok: { model: "", prompt: "" }
+        },
+        // 서비스별 AI 지시문 (비우면 기본값)
+        instructions: { nai: "", gpt: "", gemini: "", grok: "" },
+        template: null, // 템플릿 이미지 메타데이터에서 추출한 생성 파라미터 {prompt, negative, model, sampler, steps, scale, width, height, seed, raw}
+        seedLocked: false,
+        promptInstruction: ""
+      },
       // 최초 설치 시 대화목록/팔로우/제작자 캐릭터를 1회 불러와야 개인 기능이 열린다.
       onboarding: { chatListDone: false, followsDone: false, creatorCharsDone: false },
       chatListCollection: {
@@ -58,7 +81,8 @@
     recentCharacterIds: [],
     playLog: [],
     backups: {},
-    importantMessages: {}
+    importantMessages: {},
+    naiHistory: []
   });
 
   let state = defaultState();
@@ -172,8 +196,13 @@
         chatListCollection: {
           ...base.settings.chatListCollection,
           ...(saved?.settings?.chatListCollection || {})
+        },
+        nai: {
+          ...base.settings.nai,
+          ...(saved?.settings?.nai || {})
         }
       },
+      naiHistory: saved?.naiHistory || [],
       characters: saved?.characters || {},
       creators: saved?.creators || {},
       rooms: saved?.rooms || {},
@@ -1202,6 +1231,13 @@
     panel.addEventListener("input", debounce(handlePanelInput, 200));
     // 체크박스 등 토글은 디바운스 없이 즉시 처리 (빠른 조작 시 유실 방지)
     panel.addEventListener("change", handlePanelChange);
+    // details 토글(버블 안 됨) — 캡처로 받아 열림 상태를 세션 동안 유지
+    panel.addEventListener("toggle", (event) => {
+      const acc = event.target?.closest?.(".rh-acc");
+      if (!acc) return;
+      if (acc.open) chatSetOpenSections.add(acc.dataset.acc);
+      else chatSetOpenSections.delete(acc.dataset.acc);
+    }, true);
     document.documentElement.append(launcher, panel);
     applyLauncherPos();
     window.addEventListener("resize", clampLauncherIntoView);
@@ -1877,6 +1913,8 @@
         ${metricBtn("플레이", played, "played")}
         ${metricBtn("숨김", hidden, "hidden")}
         ${metricBtn("제작자", creators, "creators")}
+        ${metricBtn("NAI 생성", (state.naiHistory || []).length, "naihistory")}
+        ${metricBtn("NAI 외형", Object.values(state.characters).filter((c) => c.appearance).length, "appearance")}
       </div>
       ${renderDataSection()}
     `;
@@ -1887,7 +1925,70 @@
     if (dataSection === "played") return dataListSection("플레이한 캐릭터", Object.values(state.characters).filter((c) => c.played), characterRow);
     if (dataSection === "hidden") return dataListSection("숨긴 캐릭터", Object.values(state.characters).filter((c) => c.hidden), hiddenCharacterRow);
     if (dataSection === "creators") return dataListSection("제작자 컬렉션", Object.values(state.creators), creatorCollectionRow);
+    if (dataSection === "naihistory") return renderNaiHistorySection();
+    if (dataSection === "appearance") return renderAppearanceSection();
     return "";
+  }
+
+  function renderNaiHistorySection() {
+    const items = [...(state.naiHistory || [])].reverse();
+    return `
+      <h3>NAI 생성 이력 (${items.length}) ${items.length ? `<button type="button" class="rh-btn rh-btn-ghost rh-btn-sm" data-action="nai-hist-clear">전체 삭제</button>` : ""}</h3>
+      <p class="rh-setting-desc">생성된 원본 이미지는 <strong>다운로드 폴더 › RofanHelper › NAI</strong> 에 자동 저장됩니다. <button type="button" class="rh-btn rh-btn-ghost rh-btn-sm" data-action="nai-open-folder">다운로드 폴더 열기</button></p>
+      ${items.length ? `
+        <div class="rh-carousel rh-nai-carousel">
+          <button type="button" class="rh-carousel-nav" data-action="carousel-prev" aria-label="이전">&#8249;</button>
+          <div class="rh-carousel-track rh-nai-track">
+            ${items.map((h) => `
+              <div class="rh-nai-tile" title="${esc(h.roomTitle || "대화방")} · ${esc(fmtDate(h.createdAt))}${h.seed ? ` · 시드 ${esc(String(h.seed))}` : ""}
+${esc(h.aiPrompt)}">
+                ${h.thumb ? `<img class="rh-nai-tile-img" src="${esc(h.thumb)}" alt="">` : `<span class="rh-nai-tile-img rh-nai-hist-noimg">P</span>`}
+                <button type="button" class="rh-nai-tile-copy" data-action="nai-copy-prompt" data-id="${esc(h.id)}">프롬복사</button>
+                <button type="button" class="rh-nai-tile-del" data-action="nai-hist-del" data-id="${esc(h.id)}" title="삭제">✕</button>
+              </div>`).join("")}
+          </div>
+          <button type="button" class="rh-carousel-nav" data-action="carousel-next" aria-label="다음">&#8250;</button>
+        </div>` : empty("아직 생성 이력이 없어요.")}
+    `;
+  }
+
+  function copyNaiPrompt(id) {
+    const entry = (state.naiHistory || []).find((h) => h.id === id);
+    if (!entry) return;
+    const text = entry.aiPrompt || "";
+    const done = () => showToast("프롬프트를 복사했어요.");
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => { legacyCopy(text); done(); });
+    } else {
+      legacyCopy(text);
+      done();
+    }
+  }
+
+  function legacyCopy(text) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.append(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch {}
+    ta.remove();
+  }
+
+  function renderAppearanceSection() {
+    const items = Object.values(state.characters).filter((c) => c.appearance);
+    return `
+      <h3>NAI 캐릭터 외형 (${items.length})</h3>
+      <div class="rh-list">
+        ${items.length ? items.map((c) => `
+          <div class="rh-nai-appearance-row">
+            <strong>${esc(c.name || "이름 미확인")}</strong>
+            <textarea data-appearance-id="${esc(c.id)}">${esc(c.appearance)}</textarea>
+            <button type="button" class="rh-btn rh-btn-sm" data-action="save-appearance-row" data-id="${esc(c.id)}">저장</button>
+          </div>`).join("") : empty("저장된 외형 프롬프트가 없어요. 대화방에서 첫 이미지 생성 시 입력돼요.")}
+      </div>
+    `;
   }
 
   function dataListSection(title, items, rowFn) {
@@ -1924,13 +2025,35 @@
   }
 
   // 채팅설정 탭
+  // 채팅설정 아코디언 열림 상태 (세션 유지)
+  const chatSetOpenSections = new Set(["fixed"]);
+
+  function accSection(id, title, badge, bodyHtml) {
+    return `
+      <details class="rh-acc" data-acc="${id}" ${chatSetOpenSections.has(id) ? "open" : ""}>
+        <summary><span>${title}</span>${badge ? `<em class="rh-acc-badge">${badge}</em>` : ""}</summary>
+        <div class="rh-acc-body">${bodyHtml}</div>
+      </details>`;
+  }
+
   function renderChatSettings() {
+    const ci = state.settings.chatInput || {};
+    const sc = state.settings.shortcuts || {};
+    const c = naiConfig();
+    return `
+      ${accSection("fixed", "대화 입력 고정 인풋", ci.fixedEnabled ? "ON" : "", renderFixedInputSettings())}
+      ${accSection("shortcut", "단축어 (치환)", sc.enabled ? "ON" : "", renderShortcutSettings())}
+      ${accSection("promptai", "프롬프트 생성 AI", aiCfgFor(c.aiProvider).key ? esc(c.aiProvider) : "", renderPromptAiSettings())}
+      ${accSection("imggen", "이미지 생성 AI", c.enabled ? "ON" : "", renderImageGenSettings())}
+    `;
+  }
+
+  function renderFixedInputSettings() {
     const ci = state.settings.chatInput || {};
     const text = ci.fixedText || "";
     const count = buildFixedInputMarkup(text).length;
     const hasBracket = /[<>]/.test(text);
     return `
-      <h3>대화 입력 고정 인풋</h3>
       <p class="rh-setting-desc">활성화하면 메시지를 전송할 때(엔터/전송) API 전송 직전에 아래 내용을 <code>&lt;!--내용--&gt;</code> 형태(HTML 주석)로 함께 보냅니다. 주석이라 채팅창에는 보이지 않고 AI에게만 전달돼요.</p>
       <label class="rh-check">
         <input type="checkbox" data-field="chat-fixed-enabled" ${ci.fixedEnabled ? "checked" : ""}>
@@ -1944,8 +2067,6 @@
         <p class="rh-setting-count">전송에 추가되는 글자수: <strong>${count}</strong>자 <span>(주석 &lt;!-- --&gt; 포함)</span></p>
         <button type="button" class="rh-btn" data-action="save-fixed-input">저장</button>
       </div>
-
-      ${renderShortcutSettings()}
     `;
   }
 
@@ -1953,7 +2074,6 @@
     const sc = state.settings.shortcuts || {};
     const list = Array.isArray(sc.list) ? sc.list : [];
     return `
-      <h3 style="margin-top:24px">단축어 (치환)</h3>
       <p class="rh-setting-desc">채팅창에서 <code>/</code>를 입력하면 등록한 단축어 목록이 뜹니다. <code>/명령어</code>를 넣고 전송하면, 전송 직전에 그 <strong>단축어가 실제 내용으로 치환</strong>되어 AI에게 전달돼요. (채팅방 화면에는 입력한 <code>/명령어</code> 그대로 보일 수 있어요.)</p>
       <label class="rh-check">
         <input type="checkbox" data-field="shortcut-enabled" ${sc.enabled ? "checked" : ""}>
@@ -2246,6 +2366,1357 @@
     $("#rofan-helper-sc-chips")?.remove();
   }
 
+  // ===== NAI 이미지 생성 연동 =====
+
+  const DEFAULT_NAI_INSTRUCTION = [
+    "You are a NovelAI prompt engineer. Generate ONE Danbooru-tag prompt line from the character appearance and recent chat context below.",
+    "",
+    "Rules:",
+    "- Use Danbooru tags as base + natural language for specifics (NAI understands both)",
+    "- Be extremely specific: not 'dress' but 'white sleeveless dress, frilled layered skirt, corset bodice'. Not 'staff' but 'heart-shaped staff, silver, jeweled topper'.",
+    "- Use NAI weighting (1.3::tag ::) for key elements",
+    "- NO quality/artist tags (masterpiece, best quality, etc) — 템플릿 프롬프트에 이미 포함되어 있음",
+    "- Be extremely detailed using real tags: composition, pose with arm/hand/leg specifics, expression, gaze, hairstyle, outfit (every layer with color), background with location+time+weather, lighting, effects",
+    "- Auto-fill anything not specified with contextually appropriate tags",
+    "- Start with the character appearance tags, then the current scene from the chat",
+    "",
+    "KEY VERIFIED TAGS (use these, post count = reliability):",
+    "Composition: 1girl(7.5M), solo(6.2M), full body(1.1M), cowboy shot(749K), upper body(1M), from below(105K), dutch angle(146K)",
+    "Pose: standing(1.1M), sitting(1.1M), arms behind back(110K), hand on own hip(201K), holding(1.9M), head tilt(161K), leaning forward(145K)",
+    "Expression: smile(3.6M), blush(3.6M), half-closed eyes(126K), smirk(33K), parted lips(658K)",
+    "Outfit: shirt(2.5M), dress(1.7M), thighhighs(1.4M), gloves(1.7M), off shoulder(305K), pleated skirt(639K)",
+    "Background: outdoors(702K), indoors(487K), night(152K), sunset(35K), cherry blossoms(66K), simple background(2.4M)",
+    "Effects: sparkle(201K), depth of field(118K), petals(159K), wind(63K), lens flare(46K)",
+    "",
+    "Output ONLY the comma-separated prompt line. No explanations, no quotes, no markdown, no line breaks."
+  ].join("\n");
+
+  // 자연어 계열 이미지 모델(GPT/Gemini/Grok)용 기본 지시문
+  const DEFAULT_IMG_INSTRUCTION = [
+    "You are an expert illustration prompt writer. Based on the character appearance and the recent chat below, write ONE vivid English image-generation prompt describing the current scene.",
+    "- Natural language, 2-4 sentences.",
+    "- Include: character appearance, pose, expression, outfit, background (location/time/weather), lighting, mood, composition.",
+    "- Anime illustration style unless the chat implies otherwise.",
+    "- Output ONLY the prompt text. No quotes, no lists, no markdown."
+  ].join("\n");
+
+  function naiConfig() {
+    return state.settings.nai || {};
+  }
+
+  // 구버전 설정(단일 aiKey/template/pixaiKey)을 새 구조로 이관
+  function migrateNaiConfig() {
+    const c = state.settings.nai;
+    if (!c) return;
+    let changed = false;
+    if (!c.aiCfg) { c.aiCfg = {}; changed = true; }
+    if (c.aiKey && !c.aiCfg[c.aiProvider || "gemini"]) {
+      c.aiCfg[c.aiProvider || "gemini"] = { key: c.aiKey, model: c.aiModel || "" };
+      changed = true;
+    }
+    if (!Array.isArray(c.templates)) { c.templates = [null, null, null, null]; changed = true; }
+    if (c.template && !c.templates[0]) { c.templates[0] = c.template; changed = true; }
+    if (typeof c.activeTemplate !== "number") { c.activeTemplate = 0; changed = true; }
+    if (!c.imgCfg) { c.imgCfg = { gpt: { model: "", size: "1024x1536", prompt: "" }, gemini: { model: "", prompt: "" }, grok: { model: "", prompt: "" } }; changed = true; }
+    if (!c.instructions) { c.instructions = { nai: c.promptInstruction || "", gpt: "", gemini: "", grok: "" }; changed = true; }
+    if (c.imgProvider === "pixai") { c.imgProvider = "nai"; changed = true; } // PixAI 지원 종료
+    if (changed) saveState();
+  }
+
+  function aiCfgFor(provider) {
+    const c = naiConfig();
+    return c.aiCfg?.[provider] || { key: c.aiKey || "", model: c.aiModel || "" };
+  }
+
+  function activeNaiTemplate() {
+    const c = naiConfig();
+    return (Array.isArray(c.templates) ? c.templates[c.activeTemplate ?? 0] : null) || c.template || null;
+  }
+
+  const IMG_SERVICES = {
+    nai: { label: "NovelAI (NAI)" },
+    gpt: { provider: "openai", label: "GPT (OpenAI)", def: "gpt-image-1", models: ["gpt-image-1"] },
+    gemini: { provider: "gemini", label: "Gemini 나노바나나", def: "gemini-2.5-flash-image", models: ["gemini-2.5-flash-image", "gemini-2.5-flash-image-preview"] },
+    grok: { provider: "grok", label: "xAI Grok 이미지", def: "grok-2-image", models: ["grok-2-image"] }
+  };
+
+  function imgSvc() {
+    const v = naiConfig().imgProvider || "nai";
+    return IMG_SERVICES[v] ? v : "nai";
+  }
+
+  function imgCfgFor(svc) {
+    return naiConfig().imgCfg?.[svc] || {};
+  }
+
+  // 서비스별 AI 지시문 (비우면 서비스 기본값)
+  function instructionFor(svc) {
+    const c = naiConfig();
+    const saved = c.instructions?.[svc] || (svc === "nai" ? c.promptInstruction : "") || "";
+    return saved.trim() || (svc === "nai" ? DEFAULT_NAI_INSTRUCTION : DEFAULT_IMG_INSTRUCTION);
+  }
+
+  // 현재 이미지 서비스의 프롬프트 템플릿 (파이프라인 공용 인터페이스)
+  function activeImgTemplate() {
+    const svc = imgSvc();
+    if (svc === "nai") return activeNaiTemplate();
+    const cfg = imgCfgFor(svc);
+    const prompt = (cfg.prompt || "").trim() || "[[input data]]";
+    return { prompt, negative: "", seed: 0, hasPlaceholder: NAI_PLACEHOLDER_RE.test(prompt) };
+  }
+
+  function naiReady() {
+    const c = naiConfig();
+    const ai = aiCfgFor(c.aiProvider);
+    const svc = imgSvc();
+    const imgOk = svc === "nai"
+      ? Boolean(c.naiKey && activeNaiTemplate())
+      : Boolean(aiCfgFor(IMG_SERVICES[svc].provider).key);
+    return Boolean(c.enabled && imgOk && ai.key);
+  }
+
+  // 백그라운드 서비스워커를 통해 외부 API 호출(CORS 우회). 목업에선 직접 fetch.
+  function bgFetch(opts) {
+    if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
+      return new Promise((resolve) => {
+        let done = false;
+        const finish = (r) => { if (!done) { done = true; resolve(r); } };
+        // 응답이 영영 안 오는 경우(SW 중단 등) 대비 타임아웃 — 무한 로딩 방지
+        const timer = setTimeout(() => finish({ ok: false, status: 0, error: "응답 시간 초과 (백그라운드)" }), opts.timeoutMs || 30000);
+        try {
+          chrome.runtime.sendMessage({ type: "rh-fetch", ...opts }, (res) => {
+            clearTimeout(timer);
+            const err = chrome.runtime.lastError?.message || "";
+            finish(res || { ok: false, status: 0, error: err || "백그라운드 응답 없음" });
+          });
+        } catch (e) {
+          clearTimeout(timer);
+          finish({ ok: false, status: 0, error: String(e?.message || e) });
+        }
+      });
+    }
+    // 목업/개발 환경 폴백
+    return fetch(opts.url, { method: opts.method || "POST", headers: opts.headers || {}, body: opts.body })
+      .then(async (res) => {
+        if (opts.responseType === "arraybuffer") {
+          const buf = await res.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let bin = "";
+          for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+          return { ok: res.ok, status: res.status, base64: btoa(bin), contentType: res.headers.get("content-type") || "" };
+        }
+        return { ok: res.ok, status: res.status, text: await res.text() };
+      })
+      .catch((e) => ({ ok: false, status: 0, error: String(e?.message || e) }));
+  }
+
+  // --- PNG 메타데이터(tEXt/iTXt) 파싱: NAI 템플릿 이미지에서 생성 설정 추출 ---
+  function parsePngText(buffer) {
+    const view = new DataView(buffer);
+    const bytes = new Uint8Array(buffer);
+    const out = {};
+    if (view.getUint32(0) !== 0x89504e47) return out; // PNG 시그니처
+    let pos = 8;
+    const dec = new TextDecoder("utf-8");
+    while (pos + 8 <= bytes.length) {
+      const len = view.getUint32(pos);
+      const type = dec.decode(bytes.subarray(pos + 4, pos + 8));
+      const dataStart = pos + 8;
+      if (type === "tEXt") {
+        const data = bytes.subarray(dataStart, dataStart + len);
+        const nul = data.indexOf(0);
+        if (nul > 0) out[dec.decode(data.subarray(0, nul))] = dec.decode(data.subarray(nul + 1));
+      } else if (type === "iTXt") {
+        const data = bytes.subarray(dataStart, dataStart + len);
+        const nul = data.indexOf(0);
+        if (nul > 0) {
+          // keyword \0 compFlag compMethod \0 lang \0 translated \0 text (비압축만 처리)
+          const keyword = dec.decode(data.subarray(0, nul));
+          const compFlag = data[nul + 1];
+          let p = nul + 3;
+          let zero = data.indexOf(0, p); p = zero + 1; // lang
+          zero = data.indexOf(0, p); p = zero + 1;     // translated
+          if (compFlag === 0) out[keyword] = dec.decode(data.subarray(p));
+        }
+      } else if (type === "IEND") break;
+      pos = dataStart + len + 4;
+    }
+    return out;
+  }
+
+  const NAI_PLACEHOLDER_RE = /\[{2,3}\s*input data\s*\]{2,3}/i;
+
+  // 템플릿 이미지 파일 → NAI 생성 파라미터
+  async function extractNaiTemplate(file) {
+    const buf = await file.arrayBuffer();
+    const text = parsePngText(buf);
+    let raw = null;
+    try { raw = JSON.parse(text.Comment || "null"); } catch {}
+    if (!raw && !text.Description) return null;
+    const prompt = String(raw?.prompt ?? text.Description ?? "");
+    const source = String(text.Source || "");
+    let model = "nai-diffusion-3";
+    if (/V4\.?5/i.test(source)) model = "nai-diffusion-4-5-full";
+    else if (/V4/i.test(source)) model = "nai-diffusion-4-full";
+    return {
+      prompt,
+      negative: String(raw?.uc ?? raw?.negative_prompt ?? ""),
+      model,
+      sampler: String(raw?.sampler || "k_euler_ancestral"),
+      steps: toNumber(raw?.steps) || 28,
+      scale: Number(raw?.scale ?? 5),
+      width: toNumber(raw?.width) || 832,
+      height: toNumber(raw?.height) || 1216,
+      seed: toNumber(raw?.seed) || 0,
+      hasPlaceholder: NAI_PLACEHOLDER_RE.test(prompt),
+      // raw 메타데이터는 저장하지 않는다 — 요청은 설정값만으로 구성(잔여 필드로 인한 실패 방지)
+      source
+    };
+  }
+
+  // --- 설정 UI (채팅설정 탭 하단) ---
+  // [1] 프롬프트 생성 AI 섹션 — 제공사별 키/모델 개별 저장 + 지시문
+  function renderPromptAiSettings() {
+    const c = naiConfig();
+    const ai = aiCfgFor(c.aiProvider);
+    return `
+      <p class="rh-setting-desc">대화를 분석해 이미지 프롬프트를 만들 AI입니다. 제공사마다 API 키·모델이 <strong>따로 저장</strong>돼 언제든 전환할 수 있어요. (저렴한 모델 권장 — 1회 0.1~2원)</p>
+      <label>프롬프트 생성 AI
+        <select data-field="nai-provider">
+          <option value="gemini" ${c.aiProvider === "gemini" ? "selected" : ""}>Google Gemini (저렴 · 필터 있음)</option>
+          <option value="deepseek" ${c.aiProvider === "deepseek" ? "selected" : ""}>DeepSeek (저렴 · 필터 없음)</option>
+          <option value="openai" ${c.aiProvider === "openai" ? "selected" : ""}>OpenAI (GPT)</option>
+          <option value="grok" ${c.aiProvider === "grok" ? "selected" : ""}>xAI Grok (필터 없음)</option>
+          <option value="claude" ${c.aiProvider === "claude" ? "selected" : ""}>Anthropic Claude</option>
+        </select>
+      </label>
+      <label>API 키 <span class="rh-nai-lbl-sub">(${esc(c.aiProvider)} 전용 — 전환해도 각각 보관)</span>
+        <input type="password" data-field="nai-aikey" value="${esc(ai.key || "")}" placeholder="${esc(aiKeyPlaceholder(c.aiProvider))}">
+      </label>
+      <label>모델 (비우면 기본값: ${esc(defaultAiModel(c.aiProvider))})
+        <input type="text" data-field="nai-aimodel" list="rh-nai-model-list" value="${esc(ai.model || "")}" placeholder="${esc(defaultAiModel(c.aiProvider))}">
+        <datalist id="rh-nai-model-list">
+          ${aiModelSuggestions(c.aiProvider).map((m) => `<option value="${esc(m)}"></option>`).join("")}
+        </datalist>
+      </label>
+      <p class="rh-setting-desc" style="margin:2px 0 0">AI 지시문은 <strong>이미지 생성 AI</strong> 섹션에서 서비스별로 설정해요.</p>
+      <div class="rh-setting-row">
+        <button type="button" class="rh-btn" data-action="nai-save-ai">저장</button>
+      </div>
+    `;
+  }
+
+  // [2] 이미지 생성 AI 섹션 — 서비스별(NAI/GPT/Gemini/Grok) 설정 개별 저장
+  function renderImageGenSettings() {
+    const c = naiConfig();
+    return `
+      <label class="rh-check">
+        <input type="checkbox" data-field="nai-enabled" ${c.enabled ? "checked" : ""}>
+        이미지 생성 기능 사용 <span class="rh-nai-lbl-sub">(대화의 ✦ 버튼)</span>
+      </label>
+      <label>이미지 생성 서비스 <span class="rh-nai-lbl-sub">(서비스마다 설정·지시문 따로 저장)</span>
+        <select data-field="nai-imgprovider">
+          ${Object.entries(IMG_SERVICES).map(([v, d]) => `<option value="${v}" ${imgSvc() === v ? "selected" : ""}>${esc(d.label)}</option>`).join("")}
+        </select>
+      </label>
+      ${imgSvc() === "nai" ? renderNaiServiceSettings() : renderSimpleImgSettings(imgSvc())}
+      <label style="margin-top:10px">AI 프롬프트 지시문 (${esc(IMG_SERVICES[imgSvc()].label)} 전용) <span class="rh-nai-lbl-sub">— 지시문 아래에 구도(1/2인) 규칙 · 캐릭터 외형 · 페르소나 외형 · 최근 대화가 자동으로 붙어요</span>
+        <textarea data-field="img-instruction" class="rh-nai-instruction">${esc(instructionFor(imgSvc()))}</textarea>
+      </label>
+      <div class="rh-setting-row">
+        <button type="button" class="rh-btn rh-btn-ghost rh-btn-sm" data-action="nai-instruction-reset">지시문 기본값 복원</button>
+        <p class="rh-setting-count" style="flex:1">${naiReady() ? "설정 완료 — 대화의 ✦ 버튼으로 생성" : "키·설정을 채우면 사용 가능"}</p>
+        ${imgSvc() === "nai" ? `<button type="button" class="rh-btn rh-btn-ghost" data-action="nai-test">NAI 연결 테스트</button>` : ""}
+        <button type="button" class="rh-btn" data-action="nai-save-img">저장</button>
+      </div>
+    `;
+  }
+
+  // GPT/Gemini/Grok 이미지 서비스 설정 (키는 프롬프트 생성 AI와 공유)
+  function renderSimpleImgSettings(svc) {
+    const d = IMG_SERVICES[svc];
+    const cfg = imgCfgFor(svc);
+    const key = aiCfgFor(d.provider).key || "";
+    return `
+      <label>API 키 <span class="rh-nai-lbl-sub">(프롬프트 생성 AI의 ${esc(d.provider)} 키와 공유 — 이미 있으면 자동 연결)</span>
+        <input type="password" data-field="img-key" value="${esc(key)}" placeholder="${esc(aiKeyPlaceholder(d.provider))}">
+      </label>
+      <label>이미지 모델 (비우면 기본값: ${esc(d.def)})
+        <input type="text" data-field="img-model" list="rh-img-model-list" value="${esc(cfg.model || "")}" placeholder="${esc(d.def)}">
+        <datalist id="rh-img-model-list">${d.models.map((m) => `<option value="${esc(m)}"></option>`).join("")}</datalist>
+      </label>
+      ${svc === "gpt" ? `
+      <label>이미지 크기
+        <select data-field="img-size">
+          ${["1024x1024", "1024x1536", "1536x1024"].map((v) => `<option value="${v}" ${(cfg.size || "1024x1536") === v ? "selected" : ""}>${v}</option>`).join("")}
+        </select>
+      </label>` : ""}
+      <label>프롬프트 템플릿 <span class="rh-nai-lbl-sub">— [[input data]] 자리에 AI 프롬프트가 들어가요 (없으면 저장 시 자동 추가, 비우면 AI 프롬프트만 사용)</span>
+        <textarea data-field="img-prompt" placeholder="예: anime illustration, [[input data]], soft lighting">${esc(cfg.prompt || "")}</textarea>
+      </label>
+      <p class="rh-setting-desc" style="margin:2px 0 0">1장당 예상 비용: ${svc === "gpt" ? "약 $0.04~0.25 (크기·품질에 따라 ≈ 60~360원)" : svc === "gemini" ? "약 $0.04 (≈ 55~60원)" : "약 $0.07 (≈ 100원)"} — 생성 후 실제 비용이 결과 창에 표시돼요.</p>
+    `;
+  }
+
+  // NAI 서비스 설정 (키 + 그림체 1~4 템플릿)
+  function renderNaiServiceSettings() {
+    const c = naiConfig();
+    const idx = c.activeTemplate ?? 0;
+    const t = activeNaiTemplate();
+    const slots = [0, 1, 2, 3];
+    return `
+      <label>NAI API 키 (persistent token)
+        <input type="password" data-field="nai-naikey" value="${esc(c.naiKey || "")}" placeholder="pst-...">
+      </label>
+      <p class="rh-nai-tpl-head" style="margin-top:6px">그림체 (템플릿 슬롯)</p>
+      <div class="rh-seg">
+        ${slots.map((i) => `<button type="button" class="rh-seg-btn${idx === i ? " active" : ""}" data-action="nai-style-slot" data-slot="${i}">그림체${i + 1}${(c.templates || [])[i] ? "" : "<br><small>(비어있음)</small>"}</button>`).join("")}
+      </div>
+      <label>템플릿 이미지 업로드 → <strong>그림체${idx + 1}</strong>에 저장 <span class="rh-nai-lbl-sub">(NAI 원본 PNG, 프롬프트에 [[input data]] 자리 권장)</span>
+        <input type="file" accept="image/png" data-field="nai-template-file">
+      </label>
+      ${t ? `
+        <div class="rh-nai-template">
+          <p class="rh-nai-tpl-head">그림체${idx + 1} 설정 ${t.hasPlaceholder ? `<span class="rh-nai-ok">[[input data]] 자리 확인됨</span>` : `<span class="rh-nai-warn">자리표시 없음 — 저장 시 자동 추가</span>`}</p>
+          <label>프롬프트<textarea data-field="nai-t-prompt">${esc(t.prompt || "")}</textarea></label>
+          <label>네거티브<textarea data-field="nai-t-negative">${esc(t.negative || "")}</textarea></label>
+          <div class="rh-nai-grid">
+            <label>모델<input type="text" data-field="nai-t-model" value="${esc(t.model)}"></label>
+            <label>샘플러<input type="text" data-field="nai-t-sampler" value="${esc(t.sampler)}"></label>
+            <label>스텝<input type="number" data-field="nai-t-steps" value="${esc(String(t.steps))}"></label>
+            <label>스케일<input type="number" step="0.1" data-field="nai-t-scale" value="${esc(String(t.scale))}"></label>
+            <label>가로<input type="number" data-field="nai-t-width" value="${esc(String(t.width))}"></label>
+            <label>세로<input type="number" data-field="nai-t-height" value="${esc(String(t.height))}"></label>
+          </div>
+          <label class="rh-check">
+            <input type="checkbox" data-field="nai-seed-locked" ${c.seedLocked ? "checked" : ""}>
+            시드 고정 (<span class="rh-nai-seed">${esc(String(t.seed || 0))}</span>) — 끄면 매번 무작위
+          </label>
+        </div>` : `<p class="rh-setting-desc">그림체${idx + 1}이 비어 있어요 — 템플릿 이미지를 업로드해 주세요.</p>`}
+    `;
+  }
+
+
+  function defaultAiModel(provider) {
+    if (provider === "deepseek") return "deepseek-chat";
+    if (provider === "openai") return "gpt-4o-mini";
+    if (provider === "grok") return "grok-3-mini";
+    if (provider === "claude") return "claude-haiku-4-5";
+    return "gemini-2.0-flash";
+  }
+
+  function aiModelSuggestions(provider) {
+    if (provider === "deepseek") return ["deepseek-chat", "deepseek-reasoner"];
+    if (provider === "openai") return ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4.1"];
+    if (provider === "grok") return ["grok-3-mini", "grok-3", "grok-4"];
+    if (provider === "claude") return ["claude-haiku-4-5", "claude-3-5-haiku-latest", "claude-sonnet-4-5"];
+    return ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"];
+  }
+
+  function aiKeyPlaceholder(provider) {
+    if (provider === "gemini") return "AIza...";
+    if (provider === "grok") return "xai-...";
+    if (provider === "claude") return "sk-ant-...";
+    return "sk-...";
+  }
+
+  // 모델별 가격 (USD / 100만 토큰, [입력, 출력]) — 대략치
+  const AI_PRICES = {
+    "gemini-2.0-flash": [0.10, 0.40],
+    "gemini-2.5-flash-lite": [0.10, 0.40],
+    "gemini-2.5-flash": [0.30, 2.50],
+    "gemini-2.5-pro": [1.25, 10],
+    "deepseek-chat": [0.27, 1.10],
+    "deepseek-reasoner": [0.55, 2.19],
+    "gpt-4o-mini": [0.15, 0.60],
+    "gpt-4.1-mini": [0.40, 1.60],
+    "gpt-4.1-nano": [0.10, 0.40],
+    "gpt-4o": [2.50, 10],
+    "gpt-4.1": [2, 8],
+    "grok-3-mini": [0.30, 0.50],
+    "grok-3": [3, 15],
+    "grok-4": [3, 15],
+    "claude-haiku-4-5": [1, 5],
+    "claude-3-5-haiku": [0.80, 4],
+    "claude-sonnet-4-5": [3, 15]
+  };
+
+  // USD→KRW 환율 (12시간 캐시, 실패 시 1450 폴백)
+  async function getUsdKrw() {
+    const cached = state.settings.nai?.usdKrw;
+    if (cached?.rate && Date.now() - (cached.at || 0) < 12 * 3600 * 1000) return cached.rate;
+    try {
+      const res = await bgFetch({ url: "https://open.er-api.com/v6/latest/USD", method: "GET" });
+      const rate = res.ok ? Number(JSON.parse(res.text)?.rates?.KRW) : 0;
+      if (rate > 0) {
+        state.settings.nai = { ...naiConfig(), usdKrw: { rate, at: Date.now() } };
+        await saveState();
+        return rate;
+      }
+    } catch {}
+    return cached?.rate || 1450;
+  }
+
+  function aiCostKrw(model, usage, rate) {
+    if (!usage) return null;
+    const key = Object.keys(AI_PRICES).find((k) => String(model || "").startsWith(k));
+    if (!key) return null;
+    const [pin, pout] = AI_PRICES[key];
+    return ((usage.input || 0) * pin + (usage.output || 0) * pout) / 1e6 * rate;
+  }
+
+  function usageLine(entry) {
+    const parts = [];
+    const u = entry.aiUsage;
+    if (u && (u.input || u.output)) {
+      const total = (u.input || 0) + (u.output || 0);
+      parts.push(`AI ${total.toLocaleString()}토큰${entry.aiCostKrw != null ? ` 약 ${entry.aiCostKrw.toFixed(1)}원` : ""}`);
+    }
+    if (entry.imgCostKrw != null) parts.push(`이미지 약 ${entry.imgCostKrw.toFixed(1)}원`);
+    if (entry.aiCostKrw != null && entry.imgCostKrw != null) parts.push(`합계 약 ${(entry.aiCostKrw + entry.imgCostKrw).toFixed(1)}원`);
+    return parts.length ? parts.join(" · ") + " · " : "";
+  }
+
+  // --- AI 프롬프트 생성 ---
+  async function callAiPrompt(instructionText) {
+    const c = naiConfig();
+    const ai = aiCfgFor(c.aiProvider);
+    const model = ai.model || defaultAiModel(c.aiProvider);
+    let res;
+    if (c.aiProvider === "gemini") {
+      res = await bgFetch({
+        url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(ai.key)}`,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: instructionText }] }],
+          // 안전 필터 최대 완화 — SAFETY 계열 차단을 줄인다.
+          // (PROHIBITED_CONTENT는 설정으로 해제 불가한 핵심 필터라 여전히 걸릴 수 있음)
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
+          ]
+        })
+      });
+      if (!res.ok) throw new Error(`AI 호출 실패 (${res.status}) ${res.error || res.text?.slice(0, 200) || ""}`);
+      const data = JSON.parse(res.text);
+      const text = String(data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+      if (!text) {
+        // Gemini가 안전 필터로 차단하면 빈 응답이 온다 — 사유를 그대로 보여준다
+        const block = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason || "";
+        if (block && block !== "STOP") {
+          const hard = block === "PROHIBITED_CONTENT";
+          throw new Error(hard
+            ? `Gemini가 응답을 차단했어요 (${block}). 이 차단은 안전 설정으로도 해제할 수 없는 Gemini 핵심 필터예요 — 이 장면은 채팅설정에서 프롬프트 생성 AI를 DeepSeek이나 Grok으로 바꿔 생성해 주세요.`
+            : `Gemini가 응답을 차단했어요 (${block}). 안전 필터를 최대 완화해 두었지만 걸렸어요 — 이 장면은 DeepSeek이나 Grok으로 바꿔 생성해 주세요.`);
+        }
+      }
+      return {
+        text,
+        usage: { input: toNumber(data?.usageMetadata?.promptTokenCount), output: toNumber(data?.usageMetadata?.candidatesTokenCount) }
+      };
+    }
+    if (c.aiProvider === "claude") {
+      res = await bgFetch({
+        url: "https://api.anthropic.com/v1/messages",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": ai.key,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({ model, max_tokens: 1500, messages: [{ role: "user", content: instructionText }] })
+      });
+      if (!res.ok) throw new Error(`AI 호출 실패 (${res.status}) ${res.error || res.text?.slice(0, 200) || ""}`);
+      const data = JSON.parse(res.text);
+      return {
+        text: (data?.content || []).filter((p) => p.type === "text").map((p) => p.text).join("").trim(),
+        usage: { input: toNumber(data?.usage?.input_tokens), output: toNumber(data?.usage?.output_tokens) }
+      };
+    }
+    // OpenAI 호환 계열: deepseek / openai / grok
+    const base = c.aiProvider === "deepseek" ? "https://api.deepseek.com"
+      : c.aiProvider === "grok" ? "https://api.x.ai/v1"
+      : "https://api.openai.com/v1";
+    res = await bgFetch({
+      url: `${base}/chat/completions`,
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.key}` },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: instructionText }] })
+    });
+    if (!res.ok) throw new Error(`AI 호출 실패 (${res.status}) ${res.error || res.text?.slice(0, 200) || ""}`);
+    const data = JSON.parse(res.text);
+    return {
+      text: String(data?.choices?.[0]?.message?.content || "").trim(),
+      usage: { input: toNumber(data?.usage?.prompt_tokens), output: toNumber(data?.usage?.completion_tokens) }
+    };
+  }
+
+  function cleanAiPrompt(text) {
+    return String(text || "")
+      .replace(/```[a-z]*\n?|```/g, "")
+      .replace(/^["'\s]+|["'\s]+$/g, "")
+      .replace(/\n+/g, ", ")
+      .slice(0, 2000);
+  }
+
+  // --- NAI 이미지 생성 ---
+  // 요청은 템플릿 메타데이터(raw)를 일절 쓰지 않고, 설정 화면에 보이는 값만으로 깨끗하게 구성한다.
+  // (메타데이터 잔여 필드 — 참조 이미지, 캐릭터 좌표, 서명 등 — 가 전송 실패를 유발했음)
+  function buildNaiRequest(finalPrompt, seed) {
+    const t = activeNaiTemplate();
+    const model = t.model || "nai-diffusion-3";
+    const negative = t.negative || "";
+    const isV4 = /diffusion-4/.test(model);
+    const params = {
+      params_version: isV4 ? 3 : 1,
+      width: toNumber(t.width) || 832,
+      height: toNumber(t.height) || 1216,
+      scale: Number(t.scale ?? 5),
+      sampler: t.sampler || "k_euler_ancestral",
+      steps: toNumber(t.steps) || 28,
+      seed,
+      n_samples: 1,
+      ucPreset: 0,
+      qualityToggle: false,
+      dynamic_thresholding: false,
+      controlnet_strength: 1,
+      legacy: false,
+      add_original_image: false,
+      cfg_rescale: 0,
+      negative_prompt: negative
+    };
+    if (isV4) {
+      // 공식 웹과 동일한 필드 구성 (누락 필드가 500을 유발할 수 있음)
+      params.noise_schedule = "karras";
+      params.autoSmea = false;
+      params.legacy_v3_extend = false;
+      params.skip_cfg_above_sigma = null;
+      params.use_coords = false;
+      params.legacy_uc = false;
+      params.normalize_reference_strength_multiple = true;
+      params.inpaintImg2ImgStrength = 1;
+      params.characterPrompts = [];
+      params.v4_prompt = { caption: { base_caption: finalPrompt, char_captions: [] }, use_coords: false, use_order: true };
+      params.v4_negative_prompt = { caption: { base_caption: negative, char_captions: [] }, legacy_uc: false };
+      params.deliberate_euler_ancestral_bug = false;
+      params.prefer_brownian = true;
+    } else {
+      params.noise_schedule = "native";
+      params.sm = false;
+      params.sm_dyn = false;
+      params.uc = negative;
+    }
+    return { input: finalPrompt, model, action: "generate", parameters: params };
+  }
+
+  function decodeBase64Utf8(base64) {
+    try {
+      const bin = atob(base64 || "");
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return new TextDecoder("utf-8").decode(bytes);
+    } catch {
+      return "";
+    }
+  }
+
+  // --- GPT/Gemini/Grok 이미지 생성 ---
+  async function callGptImage(finalPrompt) {
+    const key = aiCfgFor("openai").key;
+    if (!key) throw new Error("OpenAI API 키가 비어 있어요. (프롬프트 생성 AI와 공유)");
+    const cfg = imgCfgFor("gpt");
+    const res = await bgFetch({
+      url: "https://api.openai.com/v1/images/generations",
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model: cfg.model || "gpt-image-1", prompt: finalPrompt, size: cfg.size || "1024x1536", n: 1 })
+    });
+    if (!res.ok) {
+      let msg = res.error || res.text?.slice(0, 250) || "";
+      try { msg = JSON.parse(res.text).error?.message || msg; } catch {}
+      throw new Error(`GPT 이미지 생성 실패 (${res.status}) ${msg}`);
+    }
+    const data = JSON.parse(res.text);
+    const b64 = data?.data?.[0]?.b64_json;
+    if (!b64) throw new Error("GPT 응답에 이미지가 없어요.");
+    // 비용: usage 토큰 기반(텍스트입력 $5/1M, 이미지출력 $40/1M), 없으면 크기 기준 추정
+    let costUsd = null;
+    const u = data?.usage;
+    if (u) costUsd = (toNumber(u.input_tokens) * 5 + toNumber(u.output_tokens) * 40) / 1e6;
+    else costUsd = ({ "1024x1024": 0.042, "1024x1536": 0.063, "1536x1024": 0.063 })[cfg.size || "1024x1536"] ?? 0.06;
+    return { dataUrl: `data:image/png;base64,${b64}`, costUsd };
+  }
+
+  async function callGeminiImage(finalPrompt) {
+    const key = aiCfgFor("gemini").key;
+    if (!key) throw new Error("Gemini API 키가 비어 있어요. (프롬프트 생성 AI와 공유)");
+    const cfg = imgCfgFor("gemini");
+    const model = cfg.model || "gemini-2.5-flash-image";
+    const res = await bgFetch({
+      url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: finalPrompt }] }],
+        generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+        safetySettings: [
+          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
+        ]
+      })
+    });
+    if (!res.ok) {
+      let msg = res.error || res.text?.slice(0, 250) || "";
+      try { msg = JSON.parse(res.text).error?.message || msg; } catch {}
+      throw new Error(`Gemini 이미지 생성 실패 (${res.status}) ${msg}`);
+    }
+    const data = JSON.parse(res.text);
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    const img = parts.find((x) => x.inlineData?.data);
+    if (!img) {
+      const block = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason || "";
+      throw new Error(block && block !== "STOP"
+        ? `Gemini가 이미지 생성을 차단했어요 (${block}). 이 장면은 GPT/NAI로 생성해 보세요.`
+        : "Gemini 응답에 이미지가 없어요.");
+    }
+    // 비용: 출력(이미지) 토큰 $30/1M + 입력 $0.30/1M, 없으면 1장 ≈ $0.039
+    const um = data?.usageMetadata;
+    const costUsd = um
+      ? (toNumber(um.promptTokenCount) * 0.30 + toNumber(um.candidatesTokenCount) * 30) / 1e6
+      : 0.039;
+    return { dataUrl: `data:${img.inlineData.mimeType || "image/png"};base64,${img.inlineData.data}`, costUsd };
+  }
+
+  async function callGrokImage(finalPrompt) {
+    const key = aiCfgFor("grok").key;
+    if (!key) throw new Error("Grok API 키가 비어 있어요. (프롬프트 생성 AI와 공유)");
+    const cfg = imgCfgFor("grok");
+    const res = await bgFetch({
+      url: "https://api.x.ai/v1/images/generations",
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model: cfg.model || "grok-2-image", prompt: finalPrompt, response_format: "b64_json", n: 1 })
+    });
+    if (!res.ok) {
+      let msg = res.error || res.text?.slice(0, 250) || "";
+      try { msg = JSON.parse(res.text).error || JSON.parse(res.text).error?.message || msg; } catch {}
+      throw new Error(`Grok 이미지 생성 실패 (${res.status}) ${typeof msg === "string" ? msg : JSON.stringify(msg).slice(0, 200)}`);
+    }
+    const b64 = JSON.parse(res.text)?.data?.[0]?.b64_json;
+    if (!b64) throw new Error("Grok 응답에 이미지가 없어요.");
+    return { dataUrl: `data:image/png;base64,${b64}`, costUsd: 0.07 }; // 정액 $0.07/장
+  }
+
+  async function callNaiGenerate(finalPrompt, seed) {
+    const c = naiConfig();
+    const request = buildNaiRequest(finalPrompt, seed);
+    const post = (host) => bgFetch({
+      url: `${host}/ai/generate-image`,
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${c.naiKey}` },
+      body: JSON.stringify(request),
+      responseType: "arraybuffer"
+    });
+    let res = await post("https://image.novelai.net");
+    // 연결 자체가 실패(status 0)하면 예비 도메인으로 재시도
+    if (res.status === 0) {
+      console.warn("[Rofan Helper] image.novelai.net 연결 실패 — api.novelai.net으로 재시도", res.error);
+      res = await post("https://api.novelai.net");
+    }
+    if (!res.ok) {
+      // 에러 본문(JSON)의 message를 해독해 보여준다 + 요청 내용을 콘솔에 남긴다
+      let detail = res.error || "";
+      const bodyText = decodeBase64Utf8(res.base64);
+      if (bodyText) {
+        try { detail = JSON.parse(bodyText).message || bodyText.slice(0, 300); }
+        catch { detail = bodyText.slice(0, 300); }
+      }
+      if (res.status === 0) {
+        detail = `NAI 서버에 연결하지 못했어요 (${detail || "Failed to fetch"}). 네트워크/DNS 차단일 수 있어요 — 채팅설정의 [NAI 연결 테스트]로 확인하고, 브라우저 '보안 DNS(DoH)'를 켜거나 VPN을 써보세요.`;
+      }
+      console.warn("[Rofan Helper] NAI 요청 실패", res.status, detail, request);
+      throw new Error(`NAI 호출 실패 (${res.status}) ${detail}`);
+    }
+    return extractImageFromResponse(res.base64, res.contentType);
+  }
+
+  // NAI 연결 진단: 두 도메인 도달성 + API 키 인증을 순서대로 점검
+  async function testNaiConnection() {
+    const c = naiConfig();
+    closeNaiModal();
+    const modal = openNaiModal(`
+      <div class="rh-import-spinner"></div>
+      <h3 class="rh-import-title">NAI 연결 테스트 중…</h3>
+    `);
+    const lines = [];
+    const ping = async (label, url) => {
+      const r = await bgFetch({ url, method: "GET", timeoutMs: 10000 });
+      const ok = r.status > 0;
+      lines.push(`${ok ? "✅" : "❌"} ${label}: ${ok ? `연결됨 (HTTP ${r.status})` : `연결 실패 — ${r.error || "Failed to fetch"}`}`);
+      return ok;
+    };
+    const img = await ping("image.novelai.net (이미지 생성 서버)", "https://image.novelai.net/");
+    const api = await ping("api.novelai.net (예비/계정 서버)", "https://api.novelai.net/");
+    if (c.naiKey && (img || api)) {
+      // 인증 점검도 이미지 서버로 — api.novelai.net은 "update to the image URL" 400으로 게이트됨
+      let r = await bgFetch({ url: "https://image.novelai.net/user/subscription", method: "GET", headers: { Authorization: `Bearer ${c.naiKey}` } });
+      if (r.status === 0) r = await bgFetch({ url: "https://api.novelai.net/user/subscription", method: "GET", headers: { Authorization: `Bearer ${c.naiKey}` } });
+      if (r.status === 200) {
+        let extra = "";
+        try {
+          const d = JSON.parse(r.text);
+          const tier = ["Paper", "Tablet", "Scroll", "Opus"][toNumber(d.tier)] || `tier ${d.tier}`;
+          const anlas = toNumber(d?.trainingStepsLeft?.fixedTrainingStepsLeft) + toNumber(d?.trainingStepsLeft?.purchasedTrainingSteps);
+          extra = ` — ${tier}, Anlas ${anlas.toLocaleString()}`;
+        } catch {}
+        lines.push(`✅ API 키 인증: 정상${extra}`);
+      } else {
+        lines.push(`❌ API 키 인증: HTTP ${r.status} ${r.text ? r.text.slice(0, 120) : r.error || ""}`);
+      }
+    } else if (!c.naiKey) {
+      lines.push("⚠️ NAI API 키가 비어 있어 인증 확인은 건너뜀");
+    }
+    let advice = "";
+    if (!img && !api) advice = "두 서버 모두 연결 실패 → 네트워크/DNS 차단 가능성이 큽니다. 브라우저 설정에서 '보안 DNS(DNS-over-HTTPS)'를 켜거나(예: Cloudflare 1.1.1.1), VPN 사용을 시도해 보세요.";
+    else if (!img && api) advice = "이미지 서버만 막혀 있어요. 생성 시 자동으로 예비 서버(api.novelai.net)로 재시도합니다.";
+    modal.innerHTML = `
+      <div class="rh-import-card rh-nai-card">
+        <h3 class="rh-import-title">NAI 연결 테스트 결과</h3>
+        <div class="rh-nai-test-lines">${lines.map((l) => `<p>${esc(l)}</p>`).join("")}</div>
+        ${advice ? `<p class="rh-setting-warn" style="display:block">${esc(advice)}</p>` : ""}
+        <div class="rh-nai-modal-actions"><button type="button" class="rh-btn rh-btn-ghost" data-nai-modal="close">닫기</button></div>
+      </div>`;
+    modal.addEventListener("click", (e) => { if (e.target.closest("[data-nai-modal='close']") || e.target === modal) closeNaiModal(); });
+  }
+
+  // NAI 응답(zip 또는 png) → PNG dataURL
+  async function extractImageFromResponse(base64, contentType) {
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    if (bytes[0] === 0x89 && bytes[1] === 0x50) {
+      return `data:image/png;base64,${base64}`; // PNG 직접 응답
+    }
+    if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) throw new Error(`알 수 없는 NAI 응답 형식 (${contentType || "?"})`);
+    try {
+      const { method, data } = extractFirstZipEntry(bytes);
+      let fileBytes = data;
+      if (method === 8) {
+        const ds = new DecompressionStream("deflate-raw");
+        const stream = new Blob([fileBytes]).stream().pipeThrough(ds);
+        fileBytes = new Uint8Array(await new Response(stream).arrayBuffer());
+      } else if (method !== 0) {
+        throw new Error(`지원하지 않는 압축 방식 (${method})`);
+      }
+      const blob = new Blob([fileBytes], { type: "image/png" });
+      return await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    } catch (error) {
+      // 스트림 에러가 원인 없는 TypeError("Failed to fetch")로 보이지 않게 감싼다
+      throw new Error(`NAI 응답(zip) 해제 실패: ${String(error?.message || error)}`);
+    }
+  }
+
+  // ZIP의 첫 파일 엔트리를 정확한 크기로 추출.
+  // NAI는 스트리밍 zip(로컬 헤더 크기 0, 실제 크기는 central directory에만 기록)을 보낼 수 있어,
+  // 로컬 헤더만 믿으면 뒤쪽 바이트까지 섞여 해제가 실패한다 → EOCD → central directory에서 읽는다.
+  function extractFirstZipEntry(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let method;
+    let compSize;
+    let localOff;
+    // EOCD(0x06054b50)를 끝에서부터 탐색 (zip 주석 최대 64KB 감안)
+    let eocd = -1;
+    const min = Math.max(0, bytes.length - 65557);
+    for (let i = bytes.length - 22; i >= min; i--) {
+      if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x05 && bytes[i + 3] === 0x06) { eocd = i; break; }
+    }
+    if (eocd >= 0) {
+      const cdOff = view.getUint32(eocd + 16, true);
+      if (bytes[cdOff] === 0x50 && bytes[cdOff + 1] === 0x4b && bytes[cdOff + 2] === 0x01 && bytes[cdOff + 3] === 0x02) {
+        method = view.getUint16(cdOff + 10, true);
+        compSize = view.getUint32(cdOff + 20, true);
+        localOff = view.getUint32(cdOff + 42, true);
+      }
+    }
+    if (localOff === undefined) {
+      // central directory를 못 찾으면 로컬 헤더 폴백
+      localOff = 0;
+      method = view.getUint16(8, true);
+      compSize = view.getUint32(18, true);
+    }
+    const nameLen = view.getUint16(localOff + 26, true);
+    const extraLen = view.getUint16(localOff + 28, true);
+    const start = localOff + 30 + nameLen + extraLen;
+    const data = bytes.subarray(start, compSize > 0 ? start + compSize : undefined);
+    return { method, data };
+  }
+
+  // dataURL 이미지 축소(JPEG) — 저장 용량 관리용
+  function downscaleImage(dataUrl, maxSide, quality = 0.88) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const ratio = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.round(img.width * ratio);
+        canvas.height = Math.round(img.height * ratio);
+        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = () => resolve(dataUrl);
+      img.src = dataUrl;
+    });
+  }
+
+  // --- 채팅 페이지: 고정 버튼 감지 + 이미지 도구 / 메시지별 생성 버튼 ---
+  function findPinButton() {
+    return $$("button").find((b) => b.classList.contains("bg-yellow-500") && b.querySelector("svg path[stroke-linecap]") && !isHelperElement(b));
+  }
+
+  function findRoomImageEl() {
+    return $("img[alt='PC Character Image']")
+      || $$("img.object-cover").filter((el) => !isHelperElement(el) && el.getBoundingClientRect().width > 200 && el.getBoundingClientRect().left < window.innerWidth * 0.55)[0]
+      || null;
+  }
+
+  function chatRoomId() {
+    const m = location.pathname.match(/\/chat\/([0-9a-f-]{36})/i);
+    return m ? m[1] : "";
+  }
+
+  function enhanceNaiChatTools() {
+    if (!/\/chat\//.test(location.pathname)) {
+      $("#rofan-helper-img-tools")?.remove();
+      return;
+    }
+    applyRoomCustomImage();
+    // [1] 고정 상태일 때만 도구 버튼 표시
+    const pin = findPinButton();
+    let tools = $("#rofan-helper-img-tools");
+    if (!pin) { tools?.remove(); }
+    else {
+      const hostParent = pin.parentElement;
+      if (!tools || tools.parentElement !== hostParent) {
+        tools?.remove();
+        tools = document.createElement("div");
+        tools.id = "rofan-helper-img-tools";
+        tools.innerHTML = `<button type="button" data-rh-img-action="change">이미지 변경</button>`;
+        tools.addEventListener("click", onImgToolClick);
+        if (getComputedStyle(hostParent).position === "static") hostParent.style.position = "relative";
+        hostParent.append(tools);
+      }
+    }
+    // [3] 메시지별 '이미지 생성' 버튼 (NAI 준비된 경우)
+    if (naiReady()) injectMessageGenButtons();
+    else $$(".rh-nai-msg-btn").forEach((b) => b.remove());
+  }
+
+  async function onImgToolClick(event) {
+    const btn = event.target.closest("[data-rh-img-action]");
+    if (!btn) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (btn.dataset.rhImgAction === "change") showImageChangeMenu();
+  }
+
+  function showImageChangeMenu() {
+    const roomId = chatRoomId();
+    const room = state.rooms[roomId] || {};
+    closeNaiModal();
+    const modal = openNaiModal(`
+      <h3 class="rh-import-title">대화방 이미지 변경</h3>
+      <p class="rh-setting-desc">고정된 대화방 이미지를 내 이미지(로컬)로 바꿔 보여줍니다. 새로고침해도 유지돼요. (내 화면에서만 보임)</p>
+      <div class="rh-nai-modal-actions">
+        <button type="button" class="rh-btn" data-nai-modal="pick-image">이미지 선택…</button>
+        ${room.customImage ? `<button type="button" class="rh-btn rh-btn-ghost" data-nai-modal="reset-image">원래 이미지로</button>` : ""}
+        <button type="button" class="rh-btn rh-btn-ghost" data-nai-modal="close">닫기</button>
+      </div>
+    `);
+    modal.addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-nai-modal]");
+      if (!b) return;
+      if (b.dataset.naiModal === "close") closeNaiModal();
+      if (b.dataset.naiModal === "reset-image") {
+        ensureRoom(roomId, { customImage: null });
+        await saveState();
+        applyRoomCustomImage(true);
+        closeNaiModal();
+        showToast("원래 이미지로 되돌렸어요.");
+      }
+      if (b.dataset.naiModal === "pick-image") {
+        const inp = document.createElement("input");
+        inp.type = "file";
+        inp.accept = "image/*";
+        inp.addEventListener("change", async () => {
+          const file = inp.files?.[0];
+          if (!file) return;
+          const dataUrl = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.readAsDataURL(file); });
+          const sized = await downscaleImage(dataUrl, 1400, 0.9);
+          ensureRoom(roomId, { customImage: sized });
+          await saveState();
+          applyRoomCustomImage();
+          closeNaiModal();
+          showToast("대화방 이미지를 변경했어요.");
+        });
+        inp.click();
+      }
+    });
+  }
+
+  // [2] 저장된 커스텀 이미지를 대화방 이미지에 적용(원본은 dataset에 보관)
+  // 교체 대상 수집: 넓은 화면의 <img>뿐 아니라, 좁은 화면에서 이미지가
+  // 배경(background-image)이나 모바일용 <img>로 렌더되는 경우까지 모두 잡는다.
+  function findRoomImageTargets() {
+    const targets = [];
+    $$("img").forEach((el) => {
+      if (isHelperElement(el)) return;
+      const alt = el.getAttribute("alt") || "";
+      const src = el.currentSrc || el.src || "";
+      if (/character image/i.test(alt)
+        || el.dataset.rhOrigSrc // 이미 교체된 요소(복원 대상)
+        || (/bot-assets/i.test(src) && el.getBoundingClientRect().width > 120)) {
+        targets.push({ el, type: "img" });
+      }
+    });
+    if (!targets.length) {
+      const img = findRoomImageEl();
+      if (img) targets.push({ el: img, type: "img" });
+    }
+    $$("[style*='background-image']").forEach((el) => {
+      if (isHelperElement(el)) return;
+      const bg = el.style.backgroundImage || "";
+      // 방 이미지를 배경으로 쓰는 요소(좁은 화면) 또는 이미 교체된 요소(복원 대상)
+      if (/bot-assets|img\.rofan\.ai/i.test(bg) || el.dataset.rhOrigBg) {
+        targets.push({ el, type: "bg" });
+      }
+    });
+    return targets;
+  }
+
+  function applyRoomCustomImage(forceRestore) {
+    const roomId = chatRoomId();
+    if (!roomId) return;
+    const custom = state.rooms[roomId]?.customImage;
+    findRoomImageTargets().forEach(({ el, type }) => {
+      if (type === "img") {
+        if (custom && !forceRestore) {
+          if (el.src !== custom) {
+            if (!el.dataset.rhOrigSrc) el.dataset.rhOrigSrc = el.src;
+            el.src = custom;
+            el.srcset = "";
+          }
+        } else if (el.dataset.rhOrigSrc) {
+          el.src = el.dataset.rhOrigSrc;
+          delete el.dataset.rhOrigSrc;
+        }
+      } else {
+        const want = custom ? `url("${custom}")` : "";
+        if (custom && !forceRestore) {
+          if (el.style.backgroundImage !== want) {
+            if (!el.dataset.rhOrigBg) el.dataset.rhOrigBg = el.style.backgroundImage;
+            el.style.backgroundImage = want;
+          }
+        } else if (el.dataset.rhOrigBg) {
+          el.style.backgroundImage = el.dataset.rhOrigBg;
+          delete el.dataset.rhOrigBg;
+        }
+      }
+    });
+  }
+
+  // 메시지 행 수집: 사이트의 메시지 액션 버튼 줄(북마크 등)이 있는 블록
+  function collectMessageRows() {
+    return $$(".flex.justify-end.items-center.gap-x-3").filter((row) =>
+      !isHelperElement(row) && row.querySelector("button svg") && !row.closest("#rofan-helper-panel"));
+  }
+
+  function messageContainerOf(row) {
+    return row.closest(".mt-5") || row.parentElement?.parentElement || row.parentElement;
+  }
+
+  function messageTextOf(row) {
+    const cont = messageContainerOf(row);
+    const textDiv = cont && $$("div[style*='font-size']", cont).pop();
+    return compactText((textDiv || cont)?.innerText || "", 1200);
+  }
+
+  function compactText(text, max) {
+    const t = String(text || "").replace(/\s+/g, " ").trim();
+    return t.length > max ? t.slice(0, max) : t;
+  }
+
+  function msgKeyOf(roomId, text) {
+    let h = 5381;
+    const s = roomId + "|" + text.slice(0, 200);
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+    return String(h);
+  }
+
+  function injectMessageGenButtons() {
+    collectMessageRows().forEach((row) => {
+      const inner = row.querySelectorAll(".flex.justify-end.items-center.gap-x-3");
+      const target = inner.length ? inner[inner.length - 1] : row;
+      let btn = target.querySelector(".rh-nai-msg-btn");
+      if (!btn) {
+        btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "rh-nai-msg-btn";
+        btn.title = "이미지 생성 (NAI)";
+        btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" class="rh-nai-msg-ic"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>`;
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          startNaiGeneration(row);
+        });
+        target.append(btn);
+      }
+      // 이 메시지에 생성 이력이 있으면 금색 표시(기존 버튼도 갱신)
+      const key = msgKeyOf(chatRoomId(), messageTextOf(row));
+      btn.classList.toggle("rh-nai-has-gen", (state.naiHistory || []).some((h) => h.msgKey === key));
+    });
+  }
+
+  // --- 생성 파이프라인 ---
+  function naiCharInfo() {
+    const roomId = chatRoomId();
+    const room = state.rooms[roomId] || {};
+    const charId = room.characterId || "";
+    const appearance = (charId && state.characters[charId]?.appearance) || room.naiCharAppearance || "";
+    return { roomId, charId, appearance, persona: room.naiPersona || "" };
+  }
+
+  async function saveNaiCharInfo(charText, personaText) {
+    const { roomId, charId } = naiCharInfo();
+    if (charId) ensureCharacter(charId, { appearance: charText });
+    ensureRoom(roomId, { naiCharAppearance: charText, naiPersona: personaText || null });
+    await saveState();
+  }
+
+  // "이 채팅에서 페르소나 안내 다시 보지 않기" — 세션 한정(새로고침/재입장 시 리셋)
+  const naiPersonaNoticeSkip = new Set();
+
+  async function startNaiGeneration(row) {
+    const info = naiCharInfo();
+    const text = messageTextOf(row);
+    const key = msgKeyOf(info.roomId, text);
+    const existing = (state.naiHistory || []).filter((h) => h.msgKey === key);
+    if (existing.length) {
+      showNaiResultModal(existing[existing.length - 1], row);
+      return;
+    }
+    if (!info.appearance) {
+      showAppearanceModal(() => startNaiGeneration(row));
+      return;
+    }
+    // 캐릭터 외형은 있는데(다른 방에서 등록됨) 페르소나가 없는 방:
+    // 바로 AI를 부르지 않고 1인 생성 안내 + 페르소나 등록 기회를 준다.
+    if (!info.persona && !naiPersonaNoticeSkip.has(info.roomId)) {
+      showPersonaNoticeModal(row, info.roomId);
+      return;
+    }
+    await runNaiPipeline(row, null);
+  }
+
+  function showPersonaNoticeModal(row, roomId) {
+    closeNaiModal();
+    const modal = openNaiModal(`
+      <h3 class="rh-import-title">페르소나 외형 미등록</h3>
+      <p class="rh-setting-desc">현재 페르소나 외형이 등록되지 않았습니다.<br>이 경우 <strong>캐릭터 위주의 1인 그림</strong>이 생성됩니다.</p>
+      <label class="rh-check">
+        <input type="checkbox" data-nai-field="skip-notice">
+        현재 채팅중에는 더 이상 보지 않기
+      </label>
+      <div class="rh-nai-modal-actions">
+        <button type="button" class="rh-btn" data-nai-modal="persona-register">페르소나 등록하기</button>
+        <button type="button" class="rh-btn" data-nai-modal="persona-continue">1인 그림으로 계속</button>
+        <button type="button" class="rh-btn rh-btn-ghost" data-nai-modal="close">취소</button>
+      </div>
+    `);
+    modal.addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-nai-modal]");
+      if (!b) return;
+      const skip = modal.querySelector("[data-nai-field='skip-notice']")?.checked;
+      if (skip) naiPersonaNoticeSkip.add(roomId);
+      if (b.dataset.naiModal === "close") closeNaiModal();
+      if (b.dataset.naiModal === "persona-register") {
+        showAppearanceModal(() => startNaiGeneration(row));
+      }
+      if (b.dataset.naiModal === "persona-continue") {
+        closeNaiModal();
+        await runNaiPipeline(row, null);
+      }
+    });
+  }
+
+  function showAppearanceModal(onDone) {
+    const info = naiCharInfo();
+    closeNaiModal();
+    const modal = openNaiModal(`
+      <h3 class="rh-import-title">캐릭터 외형 설정 (최초 1회)</h3>
+      <p class="rh-setting-desc">이미지 생성에 쓸 외형 프롬프트(영어 태그 권장)를 입력해 주세요. 페르소나 외형은 비워두면 캐릭터 1인 구도로만 생성돼요.</p>
+      <label>캐릭터 외형 <textarea data-nai-field="char" placeholder="예: 1boy, blonde hair, blue eyes, tall, athletic build">${esc(info.appearance || "")}</textarea></label>
+      <label>(선택) 페르소나 외형 <textarea data-nai-field="persona" placeholder="예: 1girl, long brown hair, hazel eyes, petite">${esc(info.persona || "")}</textarea></label>
+      <div class="rh-nai-modal-actions">
+        <button type="button" class="rh-btn" data-nai-modal="save-appearance">저장하고 계속</button>
+        <button type="button" class="rh-btn rh-btn-ghost" data-nai-modal="close">취소</button>
+      </div>
+    `);
+    modal.addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-nai-modal]");
+      if (!b) return;
+      if (b.dataset.naiModal === "close") closeNaiModal();
+      if (b.dataset.naiModal === "save-appearance") {
+        const charText = modal.querySelector("[data-nai-field='char']").value.trim();
+        const personaText = modal.querySelector("[data-nai-field='persona']").value.trim();
+        if (!charText) { showToast("캐릭터 외형을 입력해 주세요."); return; }
+        await saveNaiCharInfo(charText, personaText);
+        closeNaiModal();
+        onDone?.();
+      }
+    });
+  }
+
+  function buildInstruction(chatText, overridePrompt) {
+    const c = naiConfig();
+    const info = naiCharInfo();
+    const base = instructionFor(imgSvc());
+    const personaRule = info.persona
+      ? "페르소나 외형이 있으므로, 대화 상황에 따라 캐릭터 1인 구도 또는 캐릭터+페르소나 2인 구도(2people 태그) 중 알맞은 쪽을 선택."
+      : "페르소나 외형이 없으므로 캐릭터 외형 위주의 1인 구도만 생성.";
+    const chat = overridePrompt || chatText;
+    // 구버전 지시문(자리표시 포함)은 그대로 치환 지원
+    if (/\{(PERSONA_RULE|CHAR|PERSONA|CHAT)\}/.test(base)) {
+      return base
+        .replace("{PERSONA_RULE}", personaRule)
+        .replace("{CHAR}", info.appearance || "(미입력)")
+        .replace("{PERSONA}", info.persona || "(없음)")
+        .replace("{CHAT}", chat);
+    }
+    // 새 방식: 지시문 뒤에 구도 규칙·외형·대화를 자동으로 붙인다
+    return [
+      base,
+      "",
+      `[구도 규칙] ${personaRule}`,
+      `캐릭터 외형: ${info.appearance || "(미입력)"}`,
+      `페르소나 외형: ${info.persona || "(없음)"}`,
+      "최근 대화:",
+      chat
+    ].join("\n");
+  }
+
+  async function runNaiPipeline(row, forcedAiPrompt) {
+    const c = naiConfig();
+    const t = activeImgTemplate();
+    const info = naiCharInfo();
+    const text = messageTextOf(row);
+    const key = msgKeyOf(info.roomId, text);
+    closeNaiModal();
+    const modal = openNaiModal(`
+      <div class="rh-import-spinner"></div>
+      <h3 class="rh-import-title" data-nai-step>1/2 · AI가 상황을 분석하는 중…</h3>
+      <p class="rh-setting-desc" data-nai-note>대화 내용으로 프롬프트를 만들고 있어요.</p>
+    `);
+    // 1단계: AI 프롬프트 (여기서 실패하면 일반 실패 모달)
+    let aiPrompt = forcedAiPrompt;
+    let aiUsage = null;
+    let aiCost = null;
+    if (!aiPrompt) {
+      try {
+        // 최근 대화 최대 6개 블록
+        const rows = collectMessageRows();
+        const idx = rows.indexOf(row);
+        const ctx = rows.slice(Math.max(0, idx - 5), idx + 1).map(messageTextOf).join("\n---\n").slice(-4500);
+        const ai = await callAiPrompt(buildInstruction(ctx));
+        aiPrompt = cleanAiPrompt(ai.text);
+        aiUsage = ai.usage || null;
+        if (!aiPrompt) throw new Error("AI가 프롬프트를 만들지 못했어요.");
+        const rate = await getUsdKrw();
+        aiCost = aiCostKrw(aiCfgFor(c.aiProvider).model || defaultAiModel(c.aiProvider), aiUsage, rate);
+      } catch (error) {
+        console.error("[Rofan Helper] AI 프롬프트 생성 실패", error);
+        closeNaiModal();
+        openNaiModal(`
+          <h3 class="rh-import-title">프롬프트 생성 실패</h3>
+          <p class="rh-setting-warn" style="display:block">${esc(String(error?.message || error))}</p>
+          <div class="rh-nai-modal-actions"><button type="button" class="rh-btn rh-btn-ghost" data-nai-modal="close">닫기</button></div>
+        `).addEventListener("click", (e) => { if (e.target.closest("[data-nai-modal='close']")) closeNaiModal(); });
+        return;
+      }
+      // 프롬프트를 받자마자 이력에 보존 — NAI가 실패해도 AI 비용이 날아가지 않게.
+      await upsertPromptOnlyEntry(info, key, text, aiPrompt, aiUsage, aiCost);
+    }
+    // 2단계: NAI 이미지 (실패해도 프롬프트는 살아있는 결과 모달로)
+    modal.querySelector("[data-nai-step]").textContent = `2/2 · ${({ nai: "NAI", gpt: "GPT", gemini: "Gemini", grok: "Grok" })[imgSvc()]} 이미지 생성 중…`;
+    modal.querySelector("[data-nai-note]").textContent = aiPrompt.slice(0, 160);
+    const seed = c.seedLocked && t.seed ? t.seed : Math.floor(Math.random() * 4294967295);
+    try {
+      const finalPrompt = t.hasPlaceholder
+        ? t.prompt.replace(NAI_PLACEHOLDER_RE, aiPrompt)
+        : `${t.prompt ? t.prompt + ", " : ""}${aiPrompt}`;
+      const svc = imgSvc();
+      let image;
+      let imgCost = null;
+      if (svc === "nai") {
+        image = await callNaiGenerate(finalPrompt, seed);
+      } else {
+        const r = svc === "gpt" ? await callGptImage(finalPrompt)
+          : svc === "gemini" ? await callGeminiImage(finalPrompt)
+          : await callGrokImage(finalPrompt);
+        image = r.dataUrl;
+        if (r.costUsd != null) imgCost = r.costUsd * (await getUsdKrw());
+      }
+      // 저장: 방 이미지 교체 + 이력 (성공했으니 같은 대화의 이미지 없는 임시 항목은 정리)
+      // 대화방 이미지는 생성 원본(PNG) 그대로 적용 — 압축하지 않는다. (이력 썸네일만 축소본)
+      const thumb = await downscaleImage(image, 384, 0.85);
+      ensureRoom(info.roomId, { customImage: image });
+      const entry = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        roomId: info.roomId,
+        roomTitle: state.rooms[info.roomId]?.title || state.rooms[info.roomId]?.characterName || "",
+        msgKey: key,
+        msgExcerpt: text.slice(0, 120),
+        aiPrompt,
+        aiUsage,
+        aiCostKrw: aiCost,
+        imgCostKrw: imgCost,
+        seed,
+        thumb,
+        createdAt: nowIso()
+      };
+      state.naiHistory = [...(state.naiHistory || []).filter((h) => !(h.msgKey === key && !h.thumb)), entry].slice(-100);
+      await saveState();
+      applyRoomCustomImage();
+      injectMessageGenButtons();
+      saveNaiImageFile(image, info); // 원본 PNG를 다운로드 폴더(RofanHelper/NAI/)에 저장
+      showNaiResultModal(entry, row, image);
+    } catch (error) {
+      console.error("[Rofan Helper] NAI 이미지 생성 실패", error);
+      // AI 프롬프트는 이미 확보 — 결과 모달로 넘어가 NAI만 재시도할 수 있게 한다.
+      const saved = await upsertPromptOnlyEntry(info, key, text, aiPrompt, aiUsage, aiCost);
+      injectMessageGenButtons();
+      showNaiResultModal(saved, row, null, String(error?.message || error));
+    }
+  }
+
+  // 생성 원본 PNG를 다운로드 폴더의 RofanHelper/NAI/ 하위에 저장 (실패해도 흐름에 영향 없음)
+  function saveNaiImageFile(dataUrl, info) {
+    if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) return;
+    const base = String(state.rooms[info.roomId]?.title || state.rooms[info.roomId]?.characterName || "chat")
+      .replace(/[\\/:*?"<>|]+/g, "").replace(/\s+/g, "_").slice(0, 40) || "chat";
+    const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+    chrome.runtime.sendMessage(
+      { type: "rh-download", dataUrl, filename: `${base}_${stamp}.png` },
+      () => void chrome.runtime.lastError
+    );
+  }
+
+  // 이미지 없이 프롬프트만 보존하는 이력 항목(같은 대화에 하나만 유지)
+  async function upsertPromptOnlyEntry(info, key, text, aiPrompt, aiUsage, aiCost) {
+    const list = state.naiHistory || [];
+    const existing = list.find((h) => h.msgKey === key && !h.thumb);
+    if (existing) {
+      existing.aiPrompt = aiPrompt;
+      if (aiUsage) { existing.aiUsage = aiUsage; existing.aiCostKrw = aiCost; }
+      existing.createdAt = nowIso();
+      await saveState();
+      return existing;
+    }
+    const entry = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      roomId: info.roomId,
+      roomTitle: state.rooms[info.roomId]?.title || state.rooms[info.roomId]?.characterName || "",
+      msgKey: key,
+      msgExcerpt: text.slice(0, 120),
+      aiPrompt,
+      aiUsage: aiUsage || null,
+      aiCostKrw: aiCost ?? null,
+      seed: 0,
+      thumb: "",
+      createdAt: nowIso()
+    };
+    state.naiHistory = [...list, entry].slice(-100);
+    await saveState();
+    return entry;
+  }
+
+  function showNaiResultModal(entry, row, fullImage, errorMsg) {
+    closeNaiModal();
+    const history = (state.naiHistory || []).filter((h) => h.msgKey === entry.msgKey);
+    const img = fullImage || entry.thumb;
+    const modal = openNaiModal(`
+      <h3 class="rh-import-title">이미지 생성</h3>
+      ${errorMsg ? `<p class="rh-setting-warn" style="display:block">이미지 생성 실패: ${esc(errorMsg)}<br><strong>프롬프트는 저장돼 있어요</strong> — 아래에서 [이미지만 재생성]을 누르면 AI 비용 없이 이미지 생성만 다시 시도합니다.</p>` : ""}
+      ${img ? `<img class="rh-nai-result-img" src="${esc(img)}" alt="">`
+            : `<div class="rh-nai-noimg">아직 이미지가 없어요 — 프롬프트로 [이미지 재생성]을 눌러 주세요.</div>`}
+      <label>프롬프트 (수정 후 이미지 재생성 가능)
+        <textarea data-nai-field="prompt">${esc(entry.aiPrompt)}</textarea>
+      </label>
+      <p class="rh-nai-meta">${esc(usageLine(entry))}${entry.seed ? `시드 ${esc(String(entry.seed))} · ` : ""}${esc(fmtDate(entry.createdAt))}</p>
+      ${history.length > 1 ? `
+        <p class="rh-nai-tpl-head">이 대화의 생성 이력 (${history.length})</p>
+        <div class="rh-nai-hist">${history.map((h) => h.thumb
+          ? `<img src="${esc(h.thumb)}" title="${esc(h.aiPrompt.slice(0, 200))}" data-nai-hist="${esc(h.id)}">`
+          : `<span class="rh-nai-hist-noimg" title="${esc(h.aiPrompt.slice(0, 200))}" data-nai-hist="${esc(h.id)}">P</span>`).join("")}</div>` : ""}
+      <div class="rh-nai-modal-actions">
+        <button type="button" class="rh-btn" data-nai-modal="regen-image">이미지만 재생성</button>
+        <button type="button" class="rh-btn" data-nai-modal="regen-prompt">프롬프트부터 재생성</button>
+        <button type="button" class="rh-btn rh-btn-ghost" data-nai-modal="edit-appearance">외형 수정</button>
+        <button type="button" class="rh-btn rh-btn-ghost" data-nai-modal="close">닫기</button>
+      </div>
+    `);
+    modal.addEventListener("click", async (e) => {
+      const hist = e.target.closest("[data-nai-hist]");
+      if (hist) {
+        const h = (state.naiHistory || []).find((x) => x.id === hist.dataset.naiHist);
+        if (h) showNaiResultModal(h, row);
+        return;
+      }
+      const b = e.target.closest("[data-nai-modal]");
+      if (!b) return;
+      if (b.dataset.naiModal === "close") closeNaiModal();
+      if (b.dataset.naiModal === "edit-appearance") showAppearanceModal(() => showNaiResultModal(entry, row));
+      if (b.dataset.naiModal === "regen-image") {
+        const edited = modal.querySelector("[data-nai-field='prompt']").value.trim();
+        await runNaiPipeline(row, edited || entry.aiPrompt);
+      }
+      if (b.dataset.naiModal === "regen-prompt") await runNaiPipeline(row, null);
+    });
+  }
+
+  function fmtDate(iso) {
+    try { return new Date(iso).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }); }
+    catch { return iso || ""; }
+  }
+
+  // --- 공용 NAI 모달 ---
+  function openNaiModal(innerHtml) {
+    let ov = $("#rofan-helper-nai-modal");
+    if (!ov) {
+      ov = document.createElement("div");
+      ov.id = "rofan-helper-nai-modal";
+      document.documentElement.append(ov);
+    }
+    ov.innerHTML = `<div class="rh-import-card rh-nai-card">${innerHtml}</div>`;
+    ov.onclick = (e) => { if (e.target === ov) closeNaiModal(); };
+    return ov;
+  }
+
+  function closeNaiModal() {
+    $("#rofan-helper-nai-modal")?.remove();
+  }
+
 
   async function handlePanelClick(event) {
     const button = event.target.closest("button");
@@ -2323,6 +3794,136 @@
         renderPanel("chatset");
       }
     }
+    if (action === "nai-save-ai") {
+      const get = (f) => $(`[data-field="${f}"]`, panel)?.value ?? "";
+      const c = { ...naiConfig() };
+      c.aiCfg = { ...(c.aiCfg || {}) };
+      c.aiCfg[c.aiProvider] = { key: get("nai-aikey").trim(), model: get("nai-aimodel").trim() };
+      state.settings.nai = c;
+      await saveState();
+      renderPanel("chatset");
+      queueApply();
+      showToast("프롬프트 생성 AI 설정을 저장했어요.");
+    }
+    if (action === "nai-save-img") {
+      const get = (f) => $(`[data-field="${f}"]`, panel)?.value ?? "";
+      const c = { ...naiConfig() };
+      const svc = imgSvc();
+      if (svc === "nai") {
+        c.naiKey = get("nai-naikey").trim();
+        const idx = c.activeTemplate ?? 0;
+        const t = (c.templates || [])[idx];
+        if (t) {
+          let tPrompt = get("nai-t-prompt");
+          if (!NAI_PLACEHOLDER_RE.test(tPrompt)) {
+            const trimmed = tPrompt.replace(/[\s,]+$/, "");
+            tPrompt = trimmed ? `${trimmed},[[Input data]]` : "[[Input data]]";
+          }
+          c.templates = [...c.templates];
+          c.templates[idx] = {
+            ...t,
+            prompt: tPrompt,
+            negative: get("nai-t-negative"),
+            model: get("nai-t-model").trim() || t.model,
+            sampler: get("nai-t-sampler").trim() || t.sampler,
+            steps: toNumber(get("nai-t-steps")) || t.steps,
+            scale: Number(get("nai-t-scale")) || t.scale,
+            width: toNumber(get("nai-t-width")) || t.width,
+            height: toNumber(get("nai-t-height")) || t.height,
+            hasPlaceholder: NAI_PLACEHOLDER_RE.test(tPrompt)
+          };
+        }
+      } else {
+        // GPT/Gemini/Grok: 키는 프롬프트 생성 AI와 공유 저장
+        const prov = IMG_SERVICES[svc].provider;
+        c.aiCfg = { ...(c.aiCfg || {}) };
+        c.aiCfg[prov] = { ...(c.aiCfg[prov] || {}), key: get("img-key").trim(), model: c.aiCfg[prov]?.model || "" };
+        let iPrompt = get("img-prompt");
+        if (iPrompt.trim() && !NAI_PLACEHOLDER_RE.test(iPrompt)) {
+          const trimmed = iPrompt.replace(/[\s,]+$/, "");
+          iPrompt = `${trimmed},[[Input data]]`;
+        }
+        c.imgCfg = { ...(c.imgCfg || {}) };
+        c.imgCfg[svc] = {
+          ...(c.imgCfg[svc] || {}),
+          model: get("img-model").trim(),
+          prompt: iPrompt,
+          ...(svc === "gpt" ? { size: get("img-size") || "1024x1536" } : {})
+        };
+      }
+      // 서비스별 지시문 저장
+      c.instructions = { ...(c.instructions || {}), [svc]: get("img-instruction") };
+      state.settings.nai = c;
+      await saveState();
+      renderPanel("chatset");
+      queueApply();
+      showToast("이미지 생성 설정을 저장했어요.");
+    }
+    if (action === "nai-style-slot") {
+      const c = { ...naiConfig() };
+      const to = Number(button.dataset.slot) || 0;
+      const from = c.activeTemplate ?? 0;
+      // 전환 전 현재 슬롯의 편집 중 값 보존
+      const t = (c.templates || [])[from];
+      const get = (f) => $(`[data-field="${f}"]`, panel)?.value;
+      if (t && get("nai-t-prompt") !== undefined) {
+        c.templates = [...c.templates];
+        c.templates[from] = {
+          ...t,
+          prompt: get("nai-t-prompt"),
+          negative: get("nai-t-negative"),
+          model: (get("nai-t-model") || t.model).trim(),
+          sampler: (get("nai-t-sampler") || t.sampler).trim(),
+          steps: toNumber(get("nai-t-steps")) || t.steps,
+          scale: Number(get("nai-t-scale")) || t.scale,
+          width: toNumber(get("nai-t-width")) || t.width,
+          height: toNumber(get("nai-t-height")) || t.height,
+          hasPlaceholder: NAI_PLACEHOLDER_RE.test(get("nai-t-prompt") || "")
+        };
+      }
+      if ($('[data-field="nai-naikey"]', panel)) c.naiKey = $('[data-field="nai-naikey"]', panel).value.trim();
+      c.activeTemplate = to;
+      state.settings.nai = c;
+      await saveState();
+      renderPanel("chatset");
+    }
+    if (action === "nai-test") await testNaiConnection();
+    if (action === "nai-instruction-reset") {
+      const c = { ...naiConfig() };
+      c.instructions = { ...(c.instructions || {}), [imgSvc()]: "" };
+      if (imgSvc() === "nai") c.promptInstruction = "";
+      state.settings.nai = c;
+      await saveState();
+      renderPanel("chatset");
+      showToast(`${IMG_SERVICES[imgSvc()].label} 지시문을 기본값으로 되돌렸어요.`);
+    }
+    if (action === "nai-hist-del") {
+      state.naiHistory = (state.naiHistory || []).filter((h) => h.id !== button.dataset.id);
+      await saveState();
+      renderPanel("data");
+    }
+    if (action === "nai-hist-clear") {
+      state.naiHistory = [];
+      await saveState();
+      renderPanel("data");
+    }
+    if (action === "nai-copy-prompt") copyNaiPrompt(button.dataset.id);
+    if (action === "nai-open-folder") {
+      if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
+        chrome.runtime.sendMessage({ type: "rh-show-folder" }, () => void chrome.runtime.lastError);
+      } else {
+        showToast("확장 환경에서만 폴더를 열 수 있어요.");
+      }
+    }
+    if (action === "save-appearance-row") {
+      const id = button.dataset.id;
+      const ta = $(`textarea[data-appearance-id="${cssEscape(id)}"]`, panel);
+      if (id && ta) {
+        ensureCharacter(id, { appearance: ta.value.trim() });
+        await saveState();
+        showToast("외형 프롬프트를 저장했어요.");
+      }
+    }
   }
 
   async function setFolderColorMode(mode) {
@@ -2386,14 +3987,69 @@
       await saveState();
       updateShortcutUI();
     }
+    if (field === "nai-enabled") {
+      state.settings.nai = { ...naiConfig(), enabled: Boolean(event.target.checked) };
+      await saveState();
+      renderPanel("chatset");
+      queueApply();
+    }
+    if (field === "nai-seed-locked") {
+      state.settings.nai = { ...naiConfig(), seedLocked: Boolean(event.target.checked) };
+      await saveState();
+    }
+    if (field === "nai-provider") {
+      const c = { ...naiConfig() };
+      const prev = c.aiProvider;
+      // 전환 전 현재 입력을 이전 제공사 칸에 보존
+      const key = $('[data-field="nai-aikey"]', panel)?.value;
+      const model = $('[data-field="nai-aimodel"]', panel)?.value;
+      c.aiCfg = { ...(c.aiCfg || {}) };
+      if (key !== undefined) c.aiCfg[prev] = { key: key.trim(), model: (model || "").trim() };
+      c.aiProvider = String(event.target.value);
+      state.settings.nai = c;
+      await saveState();
+      renderPanel("chatset");
+    }
+    if (field === "nai-imgprovider") {
+      state.settings.nai = { ...naiConfig(), imgProvider: String(event.target.value) };
+      await saveState();
+      renderPanel("chatset");
+    }
+    if (field === "nai-template-file") {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      try {
+        const template = await extractNaiTemplate(file);
+        if (!template) { showToast("이미지에서 NAI 생성 정보를 찾지 못했어요. NAI에서 저장한 원본 PNG인지 확인해 주세요."); return; }
+        const c = { ...naiConfig() };
+        // 재렌더로 입력 중이던 값이 날아가지 않게 보존
+        const grab = (f) => $(`[data-field="${f}"]`, panel)?.value;
+        if (grab("nai-naikey") !== undefined) c.naiKey = grab("nai-naikey").trim();
+        if (grab("nai-aikey") !== undefined) {
+          c.aiCfg = { ...(c.aiCfg || {}) };
+          c.aiCfg[c.aiProvider] = { key: grab("nai-aikey").trim(), model: (grab("nai-aimodel") || "").trim() };
+        }
+        c.templates = Array.isArray(c.templates) ? [...c.templates] : [null, null, null, null];
+        c.templates[c.activeTemplate ?? 0] = template;
+        state.settings.nai = c;
+        await saveState();
+        renderPanel("chatset");
+        showToast(`그림체${(c.activeTemplate ?? 0) + 1}에 템플릿을 저장했어요.`);
+      } catch (error) {
+        console.error("[Rofan Helper] 템플릿 파싱 실패", error);
+        showToast("템플릿 이미지를 읽지 못했어요.");
+      }
+    }
   }
 
   function ensureRoom(id, patch = {}) {
     if (!id) return null;
     const prev = state.rooms[id] || {};
     const cleanPatch = {};
+    const deleteKeys = [];
     Object.entries(patch || {}).forEach(([key, value]) => {
-      if (value === undefined || value === null) return;
+      if (value === undefined) return;
+      if (value === null) { deleteKeys.push(key); return; } // 명시적 null = 해당 필드 삭제(예: 스티커 제거)
       if (value === "" && !["note", "characterAvatar", "personaAvatar"].includes(key)) return;
       cleanPatch[key] = value;
     });
@@ -2404,6 +4060,7 @@
       ...cleanPatch,
       updatedAt: nowIso()
     };
+    deleteKeys.forEach((key) => { delete state.rooms[id][key]; });
     return state.rooms[id];
   }
 
@@ -2534,6 +4191,7 @@
     enhanceChatList();
     updateChatCounterOffset();
     updateShortcutUI();
+    enhanceNaiChatTools();
   }
 
   // 캐릭터 상세 페이지의 제작자 링크(<a href="/user/{id}">)를 눌렀을 때
@@ -5190,14 +6848,14 @@
 
   function isHelperElementStrict(node) {
     return Boolean(node.closest?.(
-      "#rofan-helper-launcher, #rofan-helper-nav-button, #rofan-helper-list-toolbar, #rofan-helper-panel, #rofan-helper-toast, #rofan-helper-creator-menu, #rofan-helper-chat-counter, #rofan-helper-import-overlay, #rofan-helper-sc-dropdown, #rofan-helper-sc-chips, .rh-card-info, .rh-card-image-stats, .rh-card-image-host, .rh-inline-new-badge, .rh-modal-average-stat, .rh-modal-refresh-button"
+      "#rofan-helper-launcher, #rofan-helper-nav-button, #rofan-helper-list-toolbar, #rofan-helper-panel, #rofan-helper-toast, #rofan-helper-creator-menu, #rofan-helper-chat-counter, #rofan-helper-import-overlay, #rofan-helper-sc-dropdown, #rofan-helper-sc-chips, #rofan-helper-img-tools, #rofan-helper-nai-modal, .rh-nai-msg-btn, .rh-card-info, .rh-card-image-stats, .rh-card-image-host, .rh-inline-new-badge, .rh-modal-average-stat, .rh-modal-refresh-button"
         + ", #rofan-helper-room-editor, #rofan-helper-room-dialog, #rofan-helper-sticker-toolbar, .rh-room-note-card, .rh-room-note-line, .rh-room-menu-items, .rh-room-avatar, .rh-room-sticker, .rh-room-sticker-overlay, .rh-chat-avatar-button"
     ));
   }
 
   function isHelperElement(node) {
     return isHelperElementStrict(node) || Boolean(node.closest?.(
-      "#rofan-helper-launcher, #rofan-helper-nav-button, #rofan-helper-list-toolbar, #rofan-helper-panel, #rofan-helper-toast, #rofan-helper-creator-menu, #rofan-helper-chat-counter, #rofan-helper-import-overlay, #rofan-helper-sc-dropdown, #rofan-helper-sc-chips, .rh-card-info, .rh-card-image-stats, .rh-card-image-host, .rh-inline-new-badge, .rh-modal-average-stat, .rh-modal-refresh-button, .rh-card-shell"
+      "#rofan-helper-launcher, #rofan-helper-nav-button, #rofan-helper-list-toolbar, #rofan-helper-panel, #rofan-helper-toast, #rofan-helper-creator-menu, #rofan-helper-chat-counter, #rofan-helper-import-overlay, #rofan-helper-sc-dropdown, #rofan-helper-sc-chips, #rofan-helper-img-tools, #rofan-helper-nai-modal, .rh-nai-msg-btn, .rh-card-info, .rh-card-image-stats, .rh-card-image-host, .rh-inline-new-badge, .rh-modal-average-stat, .rh-modal-refresh-button, .rh-card-shell"
         + ", #rofan-helper-room-editor, #rofan-helper-room-dialog, #rofan-helper-sticker-toolbar, .rh-room-note-card, .rh-room-note-line, .rh-room-menu-items, .rh-room-avatar, .rh-room-sticker, .rh-room-sticker-overlay, .rh-chat-avatar-button"
     ));
   }
@@ -5219,6 +6877,7 @@
 
   async function init() {
     state = mergeState(await storage.get());
+    migrateNaiConfig();
     setupPageHookBridge();
     createShell();
     await ingestPageData();
@@ -5230,6 +6889,11 @@
     pushShortcutsConfig();
     // page-hook이 늦게 준비될 수 있어 한 번 더 전달
     setTimeout(() => { pushChatInjectConfig(); pushShortcutsConfig(); }, 500);
+    // 이미지 고정 토글은 클래스만 바뀌어 MutationObserver(childList/href)가 못 잡는다 —
+    // 채팅 페이지에서만 가볍게 주기 점검해 [이미지 변경] 버튼을 제때 붙인다.
+    setInterval(() => {
+      if (/\/chat\//.test(location.pathname)) enhanceNaiChatTools();
+    }, 900);
   }
 
   init().catch((error) => console.error("[Rofan Helper] init failed", error));

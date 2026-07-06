@@ -1,17 +1,29 @@
 {
   "manifest_version": 3,
   "name": "Rofan AI Helper",
-  "description": "Rofan AI 도우미",
-  "version": "0.20.0",
+  "description": "Rofan AI 전용 백업, 메모, 평점, 숨김, 테마, 통계 도우미",
+  "version": "0.24.3",
   "permissions": [
     "storage",
     "clipboardWrite",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "downloads"
   ],
   "host_permissions": [
     "https://rofan.ai/*",
-    "https://www.rofan.ai/*"
+    "https://www.rofan.ai/*",
+    "https://api.novelai.net/*",
+    "https://image.novelai.net/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://api.deepseek.com/*",
+    "https://api.openai.com/*",
+    "https://api.x.ai/*",
+    "https://api.anthropic.com/*",
+    "https://open.er-api.com/*"
   ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
   "content_scripts": [
     {
       "matches": [
