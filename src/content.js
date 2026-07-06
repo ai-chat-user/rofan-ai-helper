@@ -444,6 +444,9 @@
       if (Object.keys(patch).length) ensureCharacter(botId, patch);
     }
     markPlayed(botId);
+    // 현재 방 기록에 캐릭터를 연결(캐릭터별 외형 조회에 필요)
+    const roomId = location.pathname.match(/\/chat\/([0-9a-f-]{36})/i)?.[1];
+    if (roomId) ensureRoom(roomId, { characterId: botId });
     scheduleHookStateSave();
     scheduleHookApply();
   }
@@ -3389,10 +3392,50 @@ ${esc(h.aiPrompt)}">
   }
 
   // --- 생성 파이프라인 ---
+  // 채팅 페이지의 SSR 데이터에서 현재 방의 캐릭터(botId)를 알아낸다.
+  // (방 기록에 characterId가 없으면 캐릭터별 외형을 못 불러오는 문제의 해결책)
+  function chatPageBotId() {
+    try {
+      const pp = parseNextData()?.props?.pageProps || {};
+      const direct = [
+        pp.chatData?.bot_id,
+        pp.chatData?.bot?.bot_id,
+        pp.selectedBot?.bot_id,
+        pp.bot?.bot_id
+      ];
+      for (const c of direct) {
+        if (c && UUID_RE.test(String(c))) return String(c);
+      }
+      // 깊이 탐색 폴백: bot_id + 캐릭터 신호(char 등)를 가진 객체
+      let found = "";
+      const walk = (v) => {
+        if (found || !v || typeof v !== "object") return;
+        if (Array.isArray(v)) { v.forEach(walk); return; }
+        if (v.bot_id && UUID_RE.test(String(v.bot_id)) && (v.char || v.char_persona || v.char_image)) {
+          found = String(v.bot_id);
+          return;
+        }
+        Object.values(v).forEach((w) => { if (w && typeof w === "object") walk(w); });
+      };
+      walk(pp);
+      return found;
+    } catch {
+      return "";
+    }
+  }
+
   function naiCharInfo() {
     const roomId = chatRoomId();
     const room = state.rooms[roomId] || {};
-    const charId = room.characterId || "";
+    let charId = room.characterId || "";
+    if (!charId) {
+      // 방 기록에 캐릭터 연결이 없으면 페이지에서 직접 알아내 연결해 둔다
+      charId = chatPageBotId();
+      if (charId && roomId) {
+        ensureRoom(roomId, { characterId: charId });
+        saveState();
+      }
+    }
     const appearance = (charId && state.characters[charId]?.appearance) || room.naiCharAppearance || "";
     return { roomId, charId, appearance, persona: room.naiPersona || "" };
   }
