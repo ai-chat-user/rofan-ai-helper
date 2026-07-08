@@ -40,6 +40,10 @@
       chatInput: { fixedEnabled: false, fixedText: "" },
       // /단축어 치환: enabled + [{trigger, content}] 목록. showChips = 입력창에 [/명령어] 칩 표시.
       shortcuts: { enabled: false, showChips: true, list: [] },
+      // 단어 치환(표시 전용): 화면에 보이는 텍스트만 바꾼다. 실제 데이터/전송은 그대로.
+      wordSwap: { enabled: false, list: [] },
+      // 재생성 지시사항 프리셋 5칸 (재생성 모달 ↔ R+ 채팅설정 연동)
+      regenPresets: ["", "", "", "", ""],
       // NAI 이미지 생성 연동
       nai: {
         enabled: false,
@@ -82,7 +86,8 @@
     playLog: [],
     backups: {},
     importantMessages: {},
-    naiHistory: []
+    naiHistory: [],
+    chatLogs: {} // roomId → [{key, input, output, at}]
   });
 
   let state = defaultState();
@@ -203,6 +208,7 @@
         }
       },
       naiHistory: saved?.naiHistory || [],
+      chatLogs: saved?.chatLogs || {},
       characters: saved?.characters || {},
       creators: saved?.creators || {},
       rooms: saved?.rooms || {},
@@ -415,6 +421,36 @@
     // (요청 payload의 chatData.bot_id 사용 — 사이트가 제공한 정보로만 처리)
     if (/\/api\/chat\/CreateMessage/i.test(url)) {
       markPlayedFromSend(detail.reqBody);
+      captureCreateMessageLog(detail); // 대화 원문 저장 (입력+응답 스트림)
+      cleanupRegenInstruction(detail.reqBody, detail.body); // 재생성 지시 자동 제거
+    }
+    // 메시지 수정(연필) 시 저장된 대화 기록에도 반영 (검색 정확도 유지)
+    if (/\/api\/chat\/UpdateChatLog$/i.test(url.split("?")[0])) {
+      const req = parseJsonText(detail.reqBody);
+      if (req?.logId) {
+        const roomId = chatRoomId();
+        const entry = (state.chatLogs[roomId] || []).find((l) => l.key === `id:${req.logId}`);
+        if (entry) {
+          if (typeof req.userChat === "string") entry.input = stripInstructionTail(req.userChat).slice(0, 20000);
+          if (typeof req.botChat === "string") entry.output = String(req.botChat).slice(0, 20000);
+          scheduleHookStateSave();
+        }
+      }
+    }
+    // SPA로 방에 들어올 때 사이트가 받는 Next 데이터(/_next/data/…/chat/<id>.json)도 수집
+    // — 새로고침 없이도 검색창에 대화 이력이 바로 나오게
+    {
+      const nextRoom = url.match(/\/_next\/data\/[^?]*\/chat\/([0-9a-f-]{36})/i)?.[1];
+      if (nextRoom) {
+        const nextData = parseJsonText(detail.body);
+        if (nextData) ingestChatLogsData(nextData, nextRoom);
+      }
+    }
+    // 지연 로드되는 이전 대화(원문) 수집
+    if (/\/api\/chat\/(GetChatLogs|GetChatLog|GetFirstChatLog|GetChatLogsByBookmark|GetChatRerollLogs)/i.test(url)) {
+      const logsData = parseJsonText(detail.body);
+      const reqRoom = parseJsonText(detail.reqBody)?.chatId; // 요청이 가리키는 방
+      if (logsData) ingestChatLogsData(logsData, reqRoom);
     }
     // 캐릭터 정보를 열면 사이트가 GetBotTags/GetSeparatedBotAssets(botId 포함)를 부른다 →
     // 대화목록 모달 등 어디서 봤든 "최근 본 캐릭터"에 기록한다.
@@ -1918,6 +1954,7 @@
         ${metricBtn("제작자", creators, "creators")}
         ${metricBtn("NAI 생성", (state.naiHistory || []).length, "naihistory")}
         ${metricBtn("NAI 외형", Object.values(state.characters).filter((c) => c.appearance).length, "appearance")}
+        ${metricBtn("대화 기록", Object.values(state.chatLogs || {}).reduce((a, l) => a + l.length, 0), "chatlogs")}
       </div>
       ${renderDataSection()}
     `;
@@ -1929,6 +1966,7 @@
     if (dataSection === "hidden") return dataListSection("숨긴 캐릭터", Object.values(state.characters).filter((c) => c.hidden), hiddenCharacterRow);
     if (dataSection === "creators") return dataListSection("제작자 컬렉션", Object.values(state.creators), creatorCollectionRow);
     if (dataSection === "naihistory") return renderNaiHistorySection();
+    if (dataSection === "chatlogs") return renderChatLogSection();
     if (dataSection === "appearance") return renderAppearanceSection();
     return "";
   }
@@ -1977,6 +2015,45 @@ ${esc(h.aiPrompt)}">
     ta.select();
     try { document.execCommand("copy"); } catch {}
     ta.remove();
+  }
+
+  function renderChatLogSection() {
+    const total = Object.values(state.chatLogs || {}).reduce((a, l) => a + l.length, 0);
+    return `
+      <h3>대화 기록 검색 (${total}) ${total ? `<button type="button" class="rh-btn rh-btn-ghost rh-btn-sm" data-action="chatlog-clear">전체 삭제</button>` : ""}</h3>
+      <p class="rh-setting-desc">채팅 화면에 로드된 대화를 자동으로 저장해요(방당 최근 400턴). 검색 후 [바로가기]를 누르면 그 위치로 이동 — 아직 로드 안 된 옛 대화면 자동으로 이전 대화를 불러오며 찾아가요.</p>
+      <input type="text" class="rh-chatlog-search" data-field="chatlog-search" placeholder="대화 내용 검색… (입력/응답 모두)">
+      <div id="rh-chatlog-results">${renderChatLogResults("")}</div>
+    `;
+  }
+
+  function renderChatLogResults(query) {
+    const q = normSearchText(query);
+    const rows = [];
+    Object.entries(state.chatLogs || {}).forEach(([roomId, list]) => {
+      const room = state.rooms[roomId] || {};
+      const title = room.title || room.characterName || "대화방";
+      for (let i = list.length - 1; i >= 0; i--) {
+        const log = list[i];
+        if (q) {
+          const hay = normSearchText(log.input + " " + log.output);
+          if (!hay.includes(q)) continue;
+        }
+        rows.push({ roomId, title, log });
+        if (rows.length >= 30) break;
+      }
+    });
+    if (!q) rows.sort((a, b) => String(b.log.at).localeCompare(String(a.log.at)));
+    if (!rows.length) return empty(q ? "검색 결과가 없어요." : "아직 저장된 대화가 없어요. 채팅방을 열면 자동으로 수집돼요.");
+    return rows.slice(0, 30).map(({ roomId, title, log }) => `
+      <div class="rh-chatlog-row">
+        <div class="rh-chatlog-main">
+          <strong>${esc(title)}</strong> <small>${esc(fmtDate(log.at))}</small>
+          ${log.input ? `<p class="rh-chatlog-in" title="${esc(log.input)}">🙋 ${esc(log.input.slice(0, 80))}</p>` : ""}
+          ${log.output ? `<p class="rh-chatlog-out" title="${esc(log.output.slice(0, 500))}">💬 ${esc(log.output.slice(0, 100))}</p>` : ""}
+        </div>
+        <button type="button" class="rh-btn rh-btn-sm" data-action="chatlog-jump" data-room="${esc(roomId)}" data-key="${esc(log.key)}">바로가기</button>
+      </div>`).join("");
   }
 
   function renderAppearanceSection() {
@@ -2046,6 +2123,8 @@ ${esc(h.aiPrompt)}">
     return `
       ${accSection("fixed", "대화 입력 고정 인풋", ci.fixedEnabled ? "ON" : "", renderFixedInputSettings())}
       ${accSection("shortcut", "단축어 (치환)", sc.enabled ? "ON" : "", renderShortcutSettings())}
+      ${accSection("wordswap", "단어 치환 (표시만)", (state.settings.wordSwap?.enabled && (state.settings.wordSwap?.list || []).length) ? "ON" : "", renderWordSwapSettings())}
+      ${accSection("regeninst", "재생성 지시사항 (프리셋 5칸)", regenPresets().filter(Boolean).length ? `${regenPresets().filter(Boolean).length}개` : "", renderRegenPresetSettings())}
       ${accSection("promptai", "프롬프트 생성 AI", aiCfgFor(c.aiProvider).key ? esc(c.aiProvider) : "", renderPromptAiSettings())}
       ${accSection("imggen", "이미지 생성 AI", c.enabled ? "ON" : "", renderImageGenSettings())}
     `;
@@ -2069,6 +2148,53 @@ ${esc(h.aiPrompt)}">
       <div class="rh-setting-row">
         <p class="rh-setting-count">전송에 추가되는 글자수: <strong>${count}</strong>자 <span>(주석 &lt;!-- --&gt; 포함)</span></p>
         <button type="button" class="rh-btn" data-action="save-fixed-input">저장</button>
+      </div>
+    `;
+  }
+
+  // 재생성 지시사항 프리셋 설정 (재생성 모달과 연동)
+  function renderRegenPresetSettings() {
+    const presets = regenPresets();
+    return `
+      <p class="rh-setting-desc">응답 재생성 모달의 <strong>지시1~5</strong> 버튼과 연동돼요. 자주 쓰는 지시사항을 저장해 두고 재생성할 때 눌러서 불러오세요.</p>
+      ${presets.map((v, i) => `
+        <label>지시${i + 1}
+          <textarea data-field="regen-preset-${i}" rows="2" placeholder="예: 대화 시작부분에 ㅎㅎ 넣어줘">${esc(v)}</textarea>
+        </label>`).join("")}
+      <div class="rh-setting-row">
+        <button type="button" class="rh-btn" data-action="regen-presets-save">저장</button>
+      </div>
+    `;
+  }
+
+  // 단어 치환(표시 전용) 설정
+  function renderWordSwapSettings() {
+    const ws = state.settings.wordSwap || {};
+    const list = Array.isArray(ws.list) ? ws.list : [];
+    return `
+      <p class="rh-setting-desc"><strong>화면에 보이는 글자만</strong> 바꿔요 — 실제 대화 데이터·전송 내용은 그대로 유지됩니다. (채팅방 화면에서만 적용)</p>
+      <label class="rh-check">
+        <input type="checkbox" data-field="wordswap-enabled" ${ws.enabled ? "checked" : ""}>
+        단어 치환 사용
+      </label>
+      <div class="rh-sc-list">
+        ${list.length
+          ? list.map((r, i) => `
+            <div class="rh-sc-item">
+              <div class="rh-sc-item-main">
+                <span class="rh-sc-trigger">${esc(r.from)}</span>
+                <span class="rh-ws-arrow">→</span>
+                <span class="rh-sc-content">${esc(r.to || "(삭제)")}</span>
+              </div>
+              <button type="button" class="rh-sc-del" data-action="wordswap-del" data-index="${i}" title="삭제">✕</button>
+            </div>`).join("")
+          : `<p class="rh-setting-desc" style="margin:8px 0">아직 등록된 치환이 없어요.</p>`}
+      </div>
+      <div class="rh-ws-add">
+        <input type="text" class="rh-ws-from" placeholder="바꿀 단어 (예: ㅇㅇㅇ)" maxlength="100">
+        <span class="rh-ws-arrow">→</span>
+        <input type="text" class="rh-ws-to" placeholder="보일 단어 (예: ㄱㄱㄱ)" maxlength="100">
+        <button type="button" class="rh-btn rh-btn-sm" data-action="wordswap-add">추가</button>
       </div>
     `;
   }
@@ -2168,13 +2294,14 @@ ${esc(h.aiPrompt)}">
   function updateChatCounterOffset() {
     const ci = state.settings.chatInput || {};
     const input = findMainChatInput();
-    if (!ci.fixedEnabled || !input) {
+    const loreOn = roomLorebook(chatRoomId()).enabled;
+    if ((!ci.fixedEnabled && !loreOn) || !input) {
       $("#rofan-helper-chat-counter")?.remove();
       return;
     }
     if (input.dataset.rhCounterBound !== "1") {
       input.dataset.rhCounterBound = "1";
-      const handler = () => renderChatCounterChip(input);
+      const handler = () => { renderChatCounterChip(input); pushLorebookConfig(); };
       input.addEventListener("input", handler);
       input.addEventListener("focus", handler);
       input.addEventListener("blur", () => setTimeout(handler, 50));
@@ -2184,19 +2311,31 @@ ${esc(h.aiPrompt)}">
 
   function renderChatCounterChip(input) {
     const ci = state.settings.chatInput || {};
-    if (!ci.fixedEnabled || !input || !document.contains(input)) {
+    const loreOn = roomLorebook(chatRoomId()).enabled;
+    if ((!ci.fixedEnabled && !loreOn) || !input || !document.contains(input)) {
       $("#rofan-helper-chat-counter")?.remove();
       return;
     }
     const typed = (input.value || "").length;
-    const fixed = buildFixedInputMarkup(ci.fixedText || "").length;
+    const fixed = ci.fixedEnabled ? buildFixedInputMarkup(ci.fixedText || "").length : 0;
+    const lore = loreOn ? loreInjectionPreview(input.value || "").chars : 0;
     let chip = $("#rofan-helper-chat-counter");
     if (!chip) {
       chip = document.createElement("div");
       chip.id = "rofan-helper-chat-counter";
       document.documentElement.append(chip);
+      chip.addEventListener("click", (e) => {
+        if (e.target.closest("[data-rh-lore-chip]")) showAppliedLoreModal();
+      });
+      // 호버 시 적용 예정 로어북 툴팁
+      chip.addEventListener("mouseover", (e) => {
+        if (e.target.closest("[data-rh-lore-chip]")) showLoreTip(chip);
+      });
+      chip.addEventListener("mouseout", (e) => {
+        if (e.target.closest("[data-rh-lore-chip]")) scheduleLoreTipHide();
+      });
     }
-    chip.innerHTML = `전송 <strong>${typed + fixed}</strong>자 <span>(입력 ${typed} + 고정 ${fixed})</span>`;
+    chip.innerHTML = `전송 <strong>${typed + fixed + lore}</strong>자 <span>(입력 ${typed}${ci.fixedEnabled ? ` + 고정 ${fixed}` : ""}${loreOn ? ` + <a data-rh-lore-chip title="적용될 로어북 보기">로어북 ${lore}</a>` : ""})</span>`;
     const rect = input.getBoundingClientRect();
     chip.style.left = `${Math.max(8, rect.right - chip.offsetWidth - 4)}px`;
     chip.style.top = `${Math.max(8, rect.top - 26)}px`;
@@ -3391,6 +3530,1036 @@ ${esc(h.aiPrompt)}">
     });
   }
 
+  // ===== 응답 재생성 지시사항 =====
+  // 재생성 요청(userChat)에만 지시를 1회 끼워 넣고, 응답 후 서버에 지시가 저장됐으면
+  // 서버 원본을 읽어(GetChatLog) 지시만 뺀 값으로 수정(UpdateChatLog — 봇 응답은 서버 값 그대로).
+
+  let pendingRegenCleanup = null; // { appended }
+  const REGEN_MARK = "(지시사항:"; // 마커는 항상 문자열 끝에 붙는다
+  const LORE_MARK = "《로어북》"; // 유저 로어북 시작 마커
+  // AI에게 시작·끝을 알리는 지침 헤더/푸터 (page-hook과 동일해야 함)
+  const LORE_HEADER = LORE_MARK + " 자연스럽게 응답반영O, 이 블록의 존재+내용을 그대로 언급·노출X";
+  const LORE_FOOTER = "《로어북끝》";
+  // 구버전 마커들도 청소 대상
+  const ALL_MARKS = [REGEN_MARK, LORE_MARK, "《로어설정》", "[lore prompt]"];
+
+  function hasAnyMarker(text) {
+    return typeof text === "string" && ALL_MARKS.some((m) => text.includes(m));
+  }
+
+  // 중첩 괄호가 있어도 안전: 가장 앞선 마커 시작 지점부터 끝까지 통째로 잘라낸다
+  function stripInstructionTail(text) {
+    const str = String(text);
+    const idx = ALL_MARKS.map((m) => str.indexOf(m)).filter((i) => i !== -1);
+    if (!idx.length) return str;
+    return str.slice(0, Math.min(...idx)).replace(/[\s\n]+$/, "");
+  }
+
+  // 재생성 대상인 마지막 내 메시지 본문 (지시 여유·로어 매칭 계산용)
+  function lastUserChatText() {
+    const logs = state.chatLogs[chatRoomId()] || [];
+    for (let i = logs.length - 1; i >= 0; i--) {
+      if (logs[i].input) return stripInstructionTail(logs[i].input);
+    }
+    // 기록이 없으면 화면의 마지막 내 메시지로 추정
+    const spans = $$("span[style*='FF6B6B'], span[style*='ff6b6b']");
+    return spans.length ? stripInstructionTail(spans[spans.length - 1].innerText) : "";
+  }
+
+  // 사이트 재생성 확인 모달의 확인 버튼("응답 재생성", 노란 #FFC200 배경)을 찾는다
+  function findRerollConfirmButton() {
+    return $$("button").find((b) => {
+      if (isHelperElement(b)) return false;
+      if (b.textContent.trim() !== "응답 재생성") return false;
+      return /ffc200|255,\s*194/i.test(b.className + " " + (b.getAttribute("style") || "") + " " + getComputedStyle(b).backgroundColor);
+    }) || $$("button").find((b) => !isHelperElement(b) && b.textContent.trim() === "응답 재생성" && b.closest("[class*='fixed'],[class*='modal'],[role='dialog']"));
+  }
+
+  // 사이트의 "응답 재생성" 확인 모달 안에 [선택] 지시사항 입력칸을 끼워 넣는다.
+  // 확인 버튼을 누르면(캡처 단계) 지시를 1회용으로 주입하고, 이후 서버 저장분을 자동 정리한다.
+  function enhanceRerollModal() {
+    if (!/\/chat\//.test(location.pathname)) return;
+    const confirmBtn = findRerollConfirmButton();
+    if (!confirmBtn) return;
+    // 문서 전역 + 버튼 플래그 이중 가드 — 삽입/리스너 중복 방지
+    if ($("#rofan-helper-regen-inst") || confirmBtn.dataset.rhRegenHooked) return;
+    confirmBtn.dataset.rhRegenHooked = "1";
+    const btnRow = confirmBtn.parentElement; // 취소/재생성 버튼 줄
+    const box = btnRow?.parentElement || confirmBtn.parentElement;
+    if (!box) return;
+    const field = document.createElement("div");
+    field.id = "rofan-helper-regen-inst";
+    field.className = "rh-regen-inst";
+    const presets = regenPresets();
+    field.className += " rh-off"; // 기본은 지시 없이(일반 재생성)
+    field.innerHTML = `
+      <label class="rh-regen-use"><input type="checkbox" data-rh-regen-use> ✨ 이번 재생성에 지시사항 사용 <span>— 체크 해제 시 일반 재생성 · 응답 후 자동 삭제</span></label>
+      <div class="rh-regen-presets">
+        ${presets.map((v, i) => `<button type="button" data-rh-preset="${i}" class="${v ? "" : "rh-empty"}" title="${esc(v || "비어있음 — 내용 입력 후 [저장]으로 채워요")}">지시${i + 1}</button>`).join("")}
+        <button type="button" data-rh-preset-save title="현재 내용을 선택한 칸에 저장">저장</button>
+      </div>
+      <textarea rows="2" placeholder="지시1~5를 눌러 저장된 지시를 불러올 수 있어요"></textarea>
+      <p class="rh-regen-budget" data-rh-regen-budget></p>`;
+    (btnRow?.parentElement || box).insertBefore(field, btnRow);
+    const ta = field.querySelector("textarea");
+    ta.addEventListener("click", (e) => e.stopPropagation());
+    const useChk = field.querySelector("[data-rh-regen-use]");
+    const budgetEl = field.querySelector("[data-rh-regen-budget]");
+    const baseText = lastUserChatText();
+    const baseLen = baseText.length;
+    let overBudget = false;
+    const syncUse = (on) => {
+      useChk.checked = on && !overBudget;
+      field.classList.toggle("rh-off", !useChk.checked);
+    };
+    // 기존 대화 + 지시가 1,500자를 넘으면 지시 사용 불가(일반 재생성만).
+    // 로어북도 실시간 재계산 — 재생성 메시지+직전 응답 기준 매칭, 지시 길이만큼 여유 축소.
+    const updateBudget = () => {
+      const appended = ta.value.trim() ? `\n\n(지시사항: ${ta.value.trim()})` : "";
+      overBudget = baseLen + appended.length > 1500;
+      const usedLen = baseLen + (overBudget ? 0 : appended.length);
+      const lore = loreInjectionPreview(baseText, usedLen);
+      const total = usedLen + lore.chars;
+      budgetEl.textContent = overBudget
+        ? `⚠️ 기존 ${baseLen}자 + 지시 ${appended.length}자 = 1,500자 초과 — 지시 없이 재생성돼요${lore.chars ? ` (로어북 ${lore.chars}자는 적용)` : ""}`
+        : `기존 ${baseLen}${appended ? ` + 지시 ${appended.length}` : ""}${lore.chars ? ` + 로어북 ${lore.chars}` : ""} = ${total}자 / 1,500자${lore.skipped.length ? ` · 로어 ${lore.skipped.length}개 글자수 초과로 생략` : ""}`;
+      budgetEl.classList.toggle("rh-over", overBudget);
+      ta.classList.toggle("rh-over", overBudget);
+      if (overBudget) syncUse(false);
+    };
+    updateBudget();
+    useChk.addEventListener("click", (e) => e.stopPropagation());
+    useChk.addEventListener("change", () => syncUse(useChk.checked));
+    ta.addEventListener("input", () => { updateBudget(); if (ta.value.trim() && !overBudget) syncUse(true); }); // 입력하면 자동 체크
+    let selectedPreset = -1;
+    field.querySelector(".rh-regen-presets").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const saveBtn = e.target.closest("[data-rh-preset-save]");
+      const chip = e.target.closest("[data-rh-preset]");
+      if (saveBtn) {
+        const slot = selectedPreset >= 0 ? selectedPreset : regenPresets().findIndex((v) => !v);
+        const idx = slot >= 0 ? slot : 0;
+        await saveRegenPreset(idx, ta.value.trim());
+        field.querySelectorAll("[data-rh-preset]").forEach((b, i) => {
+          b.classList.toggle("rh-empty", !regenPresets()[i]);
+          b.title = regenPresets()[i] || "비어있음";
+        });
+        showToast(`지시${idx + 1}에 저장했어요.`);
+        return;
+      }
+      if (chip) {
+        selectedPreset = Number(chip.dataset.rhPreset);
+        ta.value = regenPresets()[selectedPreset] || "";
+        field.querySelectorAll("[data-rh-preset]").forEach((b) => b.classList.toggle("rh-on", b === chip));
+        updateBudget();
+        if (ta.value.trim() && !overBudget) syncUse(true); // 프리셋 불러오면 자동 체크
+        ta.focus();
+      }
+    });
+    // 확인 버튼 캡처 리스너: 사이트 핸들러(전송)보다 먼저 실행돼 주입을 준비한다
+    confirmBtn.addEventListener("click", () => {
+      if (overBudget && ta.value.trim()) showToast("1,500자 초과 — 지시 없이 일반 재생성합니다.");
+      const text = (useChk.checked && !overBudget) ? ta.value.trim() : ""; // 해제/초과 = 일반 재생성
+      if (text) {
+        const appended = `\n\n(지시사항: ${text})`;
+        pendingRegenCleanup = { appended };
+        window.dispatchEvent(new CustomEvent("rofan-helper:regen-inject", {
+          detail: JSON.stringify({ append: appended })
+        }));
+        showToast("지시사항과 함께 재생성 중…");
+      }
+    }, true);
+  }
+
+  function regenPresets() {
+    const arr = state.settings.regenPresets;
+    return Array.isArray(arr) && arr.length === 5 ? arr : ["", "", "", "", ""];
+  }
+
+  async function saveRegenPreset(index, text) {
+    const arr = regenPresets().slice();
+    arr[index] = text;
+    state.settings.regenPresets = arr;
+    await saveState();
+  }
+
+  // 재생성 응답 완료 후: 지시가 저장된 로그(원본 log + 재생성으로 생긴 새 log 모두)를 찾아
+  // 지시만 뺀 값으로 수정한다. 안전장치: botChat이 확보되지 않으면 절대 업데이트하지 않는다.
+  async function cleanupRegenInstruction(reqBody, respBody) {
+    const req = parseJsonText(reqBody) || {};
+    const uc = String(req.userChat || "");
+    if (!hasAnyMarker(uc)) return; // 마커(지시/로어) 없는 일반 전송
+    pendingRegenCleanup = null;
+    // 응답 스트림에서 새 봇 응답 텍스트를 재조립(예비 botChat) + 새 로그 id 수집
+    const ids = [];
+    const addId = (v) => { if (v && UUID_RE.test(String(v)) && !ids.includes(String(v))) ids.push(String(v)); };
+    const tokens = [];
+    String(respBody || "").split(/\n+/).forEach((line) => {
+      const t = line.replace(/^data:\s*/, "").trim();
+      if (!t) return;
+      const j = parseJsonText(t);
+      if (!j) return;
+      if (typeof j.token === "string") tokens.push(j.token);
+      if (j.logData) {
+        const scan = (o, depth) => {
+          if (!o || typeof o !== "object" || depth > 4) return;
+          Object.entries(o).forEach(([k, v]) => {
+            if (typeof v === "string" && /log|^id$/i.test(k)) addId(v);
+            else if (v && typeof v === "object") scan(v, depth + 1);
+          });
+        };
+        scan(typeof j.logData === "object" ? j.logData : parseJsonText(j.logData) || {}, 0);
+      }
+    });
+    const streamOutput = tokens.join("");
+    addId(req.logId); addId(req.log_id);
+    if (!ids.length) { console.warn("[Rofan Helper] 재생성 logId를 찾지 못해 지시 제거를 건너뜀"); return; }
+    const cleanedInput = stripInstructionTail(String(req.userChat || ""));
+    let cleanedAny = false;
+    const done = new Set();     // 정리 완료
+    const cleanIds = new Set(); // 서버가 이미 깨끗함(마커 없음) — 손댈 필요 없음
+    const updateLog = async (logId, userChat, botChat) => {
+      const upd = await fetch("/api/chat/UpdateChatLog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ logId, userChat, botChat })
+      });
+      if (upd.ok) { done.add(logId); cleanedAny = true; }
+      else console.warn("[Rofan Helper] UpdateChatLog 실패", logId, upd.status);
+      return upd.ok;
+    };
+    // 서버 저장이 늦을 수 있어 2초·4초 두 번 시도한다
+    for (const delay of [2000, 4000]) {
+      await new Promise((r) => setTimeout(r, delay));
+      for (const logId of ids.slice(0, 5)) {
+        if (done.has(logId) || cleanIds.has(logId)) continue;
+        try {
+          const res = await fetch("/api/chat/GetChatLog", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({ logId, userData: req.userData })
+          });
+          if (!res.ok) { console.warn("[Rofan Helper] GetChatLog 실패", logId, res.status); continue; }
+          const data = await res.json();
+          if (data?.error) { console.warn("[Rofan Helper] GetChatLog 오류 응답", logId, data.error); continue; }
+          const logs = walkRawChatLogs(data);
+          const entry = logs.find((l) => l.id === logId && hasAnyMarker(l.input))
+            || logs.find((l) => hasAnyMarker(l.input));
+          if (!entry) {
+            // 로그는 있는데 마커가 없음 → 이 로그는 깨끗함
+            if (logs.some((l) => l.input || l.output)) cleanIds.add(logId);
+            continue;
+          }
+          const cleaned = stripInstructionTail(entry.input);
+          const botChat = (entry.output || "").trim() || streamOutput.trim();
+          if (!cleaned.trim() || !botChat) {
+            console.warn("[Rofan Helper] botChat/원문 미확보 — 건너뜀(데이터 보호)", logId);
+            continue;
+          }
+          await updateLog(logId, cleaned, botChat);
+        } catch (error) {
+          console.warn("[Rofan Helper] 지시/로어 제거 실패", logId, error);
+        }
+      }
+      if (ids.slice(0, 5).every((id) => done.has(id) || cleanIds.has(id))) break;
+    }
+    // GetChatLog로 확인 불가능했던 새 로그(재생성 결과)는, 이미 아는 데이터로 직접 수정
+    // (원문 입력 = 요청에서 마커 제거, 봇 응답 = 방금 스트림으로 받은 텍스트 — 둘 다 확보된 경우만)
+    if (!cleanedAny && cleanedInput.trim() && streamOutput.trim()) {
+      const newId = ids.find((id) => id !== String(req.logId || "") && !cleanIds.has(id));
+      if (newId) {
+        try {
+          const ok = await updateLog(newId, cleanedInput, streamOutput);
+          if (ok) console.info("[Rofan Helper] 새 로그 직접 정리", newId);
+        } catch (error) {
+          console.warn("[Rofan Helper] 직접 정리 실패", newId, error);
+        }
+      }
+    }
+    if (cleanedAny) {
+      showToast("입력에서 지시사항·로어북을 지웠어요.");
+      cleanupRegenDom(); // 화면에서도 즉시 제거(새로고침 불필요)
+    }
+  }
+
+  // 화면에 표시된 내 메시지 텍스트에서 지시사항 흔적을 모두 제거(표시 즉시 반영)
+  function cleanupRegenDom() {
+    // 로어/지시는 따옴표 밖(나레이션 영역)에 렌더될 수 있어 메시지 블록 전체를 검사한다
+    const blocks = $$("div[style*='font-size: 15px'], div[style*='font-size:15px']").filter((b) => !isHelperElement(b));
+    blocks.forEach((el) => {
+      if (!hasAnyMarker(el.textContent)) return;
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      const nodes = [];
+      let node;
+      while ((node = walker.nextNode())) nodes.push(node);
+      let cutting = false;
+      nodes.forEach((n) => {
+        if (cutting) { n.nodeValue = ""; return; } // 마커 이후의 노드는 전부 제거
+        const idx = ALL_MARKS.map((m) => n.nodeValue.indexOf(m)).filter((i) => i !== -1);
+        if (idx.length) {
+          n.nodeValue = n.nodeValue.slice(0, Math.min(...idx)).replace(/[\s\n]+$/, "");
+          cutting = true;
+        }
+      });
+    });
+  }
+
+  // ===== 유저 로어북 (방 전용) =====
+  // 키워드(콤마 구분)가 입력/직전 응답에 나오면, 해당 로어 내용을 전송 직전에
+  // [lore prompt] 마커로 몰래 붙인다(화면·수정창에 안 보이고 응답 후 자동 정리 — 지시사항과 동일 체계).
+
+  function roomLorebook(roomId) {
+    const room = state.rooms[roomId] || {};
+    return room.lorebook || { enabled: false, entries: [] };
+  }
+
+  async function saveRoomLorebook(roomId, lorebook) {
+    ensureRoom(roomId, {});
+    state.rooms[roomId].lorebook = lorebook;
+    await saveState();
+    pushLorebookConfig();
+  }
+
+  function countMentions(text, keyword) {
+    if (!text || !keyword) return 0;
+    let count = 0;
+    let pos = 0;
+    const t = text.toLowerCase();
+    const k = keyword.toLowerCase();
+    while ((pos = t.indexOf(k, pos)) !== -1) { count += 1; pos += k.length; }
+    return count;
+  }
+
+  function loreKeywords(entry) {
+    return String(entry.keywords || "").split(",").map((k) => k.trim()).filter(Boolean);
+  }
+
+  function loreBlockOf(entry) {
+    return `## ${String(entry.title || "").trim()}\n${String(entry.content || "").trim()}`;
+  }
+
+  // 선별: 입력+직전 응답에서 키워드가 언급된 로어만.
+  // 정렬 [1] 우선순위(수동) 높은 것 → [2] 입력 언급수 → [3] 직전 응답 언급수
+  function computeLoreSelection(inputText) {
+    const roomId = chatRoomId();
+    const lb = roomLorebook(roomId);
+    if (!lb.enabled || !Array.isArray(lb.entries) || !lb.entries.length) return [];
+    const logs = state.chatLogs[roomId] || [];
+    const lastOutput = logs.length ? String(logs[logs.length - 1].output || "") : "";
+    const input = String(inputText || "");
+    const matched = [];
+    lb.entries.forEach((entry) => {
+      if (!String(entry.content || "").trim()) return;
+      let inCnt = 0;
+      let outCnt = 0;
+      const hits = []; // 어떤 키워드가 몇 번 매칭됐는지
+      loreKeywords(entry).forEach((k) => {
+        const i = countMentions(input, k);
+        const o = countMentions(lastOutput, k);
+        if (i + o > 0) hits.push({ k, i, o });
+        inCnt += i;
+        outCnt += o;
+      });
+      if (inCnt + outCnt > 0) matched.push({ entry, inCnt, outCnt, hits, block: loreBlockOf(entry) });
+    });
+    matched.sort((a, b) =>
+      (Number(b.entry.priority) || 0) - (Number(a.entry.priority) || 0)
+      || b.inCnt - a.inCnt
+      || b.outCnt - a.outCnt);
+    return matched;
+  }
+
+  // page-hook에 현재 선별 결과 전달 (입력이 바뀔 때마다 갱신)
+  let lastLorePush = "";
+  // 매칭은 page-hook이 "실제 전송 메시지" 기준으로 수행 (재생성도 커버)
+  function pushLorebookConfig() {
+    const roomId = chatRoomId();
+    const lb = /\/chat\//.test(location.pathname) ? roomLorebook(roomId) : { enabled: false };
+    const entries = (lb.enabled && Array.isArray(lb.entries))
+      ? lb.entries.filter((e) => String(e.content || "").trim())
+        .map((e) => ({ title: e.title, keywords: e.keywords, content: e.content, priority: e.priority }))
+      : [];
+    const logs = state.chatLogs[roomId] || [];
+    const lastOutput = logs.length ? String(logs[logs.length - 1].output || "").slice(0, 10000) : "";
+    const detail = JSON.stringify({ entries, lastOutput });
+    if (detail === lastLorePush) return;
+    lastLorePush = detail;
+    window.dispatchEvent(new CustomEvent("rofan-helper:lorebook", { detail }));
+  }
+
+  // 예상 적용 결과(카운터·적용 모달용): 1500자 예산 시뮬레이션
+  function loreInjectionPreview(inputText, usedLenOverride) {
+    const selection = computeLoreSelection(inputText);
+    if (!selection.length) return { chars: 0, applied: [], skipped: [] };
+    const ci = state.settings.chatInput || {};
+    const fixedLen = ci.fixedEnabled ? buildFixedInputMarkup(ci.fixedText || "").length : 0;
+    const header = "\n\n" + LORE_HEADER;
+    const footer = "\n" + LORE_FOOTER;
+    const used = usedLenOverride != null ? usedLenOverride : String(inputText || "").length + fixedLen;
+    let remain = 1500 - used - header.length - footer.length;
+    let chars = 0;
+    const applied = [];
+    const skipped = [];
+    selection.forEach((m) => {
+      if (m.block.length + 1 <= remain) {
+        applied.push(m);
+        remain -= m.block.length + 1;
+        chars += m.block.length + 1;
+      } else {
+        skipped.push(m);
+      }
+    });
+    if (applied.length) chars += header.length + footer.length;
+    return { chars, applied, skipped };
+  }
+
+  // '+' 메뉴(메모/북마크/…)에 '유저로어북' 항목 삽입.
+  // 구조를 모르므로: 고유한 텍스트("메모리북" 등)를 XPath로 찾고, 조상으로 올라가며
+  // '메모'와 '북마크' 항목이 나란히 있는 레벨을 찾아 그 사이에 복제 삽입한다.
+  function findTextEls(label) {
+    const out = [];
+    try {
+      const r = document.evaluate(
+        `//*[normalize-space(text())="${label}"]`,
+        document.body, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+      );
+      for (let i = 0; i < r.snapshotLength; i++) out.push(r.snapshotItem(i));
+    } catch {}
+    return out;
+  }
+
+  function enhanceLorebookMenuItem() {
+    if (!/\/chat\//.test(location.pathname)) return;
+    const existing = $("#rofan-helper-lore-menu-item");
+    if (existing) {
+      // 보이는 메뉴 안에 살아있으면 유지, 숨겨진/떨어진 메뉴에 남았으면 제거 후 재삽입
+      if (existing.isConnected && existing.getBoundingClientRect().width > 0) return;
+      existing.remove();
+    }
+    // 메뉴 열림 감지용 앵커 (여러 후보 시도) — 화면에 보이는 것만
+    const anchor = ["메모리북", "이미지첨부", "이미지 첨부", "북마크"].flatMap(findTextEls)
+      .find((el) => el && !isHelperElement(el) && el.getBoundingClientRect().width > 0);
+    if (!anchor) return;
+    // 항목 버튼은 제목+부제가 합쳐진 텍스트라(예: "메모자주 사용하는 문구 관리")
+    // "리프 요소의 정확한 텍스트"로 판별한다
+    const hasLeafText = (root, label) => {
+      if (!root.children.length) return root.textContent.trim() === label;
+      return [...root.querySelectorAll("*")].some((el) => !el.children.length && el.textContent.trim() === label);
+    };
+    // 조상으로 5단계까지 올라가며 '메모'와 '북마크' 항목이 형제로 있는 컨테이너를 찾는다
+    let level = anchor;
+    for (let depth = 0; depth < 6 && level && level !== document.body; depth++) {
+      const parent = level.parentElement;
+      if (!parent) break;
+      const sibs = [...parent.children];
+      const memoEl = sibs.find((sib) => hasLeafText(sib, "메모"));
+      const bookEl = sibs.find((sib) => hasLeafText(sib, "북마크"));
+      if (memoEl && bookEl && memoEl !== bookEl) {
+        const item = memoEl.cloneNode(true); // 사이트 스타일 그대로 (아이콘·hover 포함)
+        item.id = "rofan-helper-lore-menu-item";
+        // 제목 리프("메모") → "유저로어북", 그 부제목 → 설명 교체
+        const titleLeaf = [...item.querySelectorAll("*")].find((el) => !el.children.length && el.textContent.trim() === "메모")
+          || (!item.children.length && item.textContent.trim() === "메모" ? item : null);
+        if (titleLeaf) {
+          titleLeaf.textContent = "유저로어북";
+          const sub = titleLeaf.nextElementSibling;
+          if (sub && !sub.children.length) sub.textContent = "이 방 전용 키워드 로어북";
+        } else {
+          item.textContent = "유저로어북";
+        }
+        item.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          document.body.click(); // 사이트 메뉴 닫기
+          showLorebookModal();
+        }, true);
+        // 메모 다음의 구분선(있으면) 뒤에 [항목 + 구분선 복제] 삽입 → 메모 | 유저로어북 | 북마크
+        const nextEl = memoEl.nextElementSibling;
+        const isDivider = nextEl && nextEl !== bookEl && !nextEl.textContent.trim();
+        if (isDivider) {
+          parent.insertBefore(item, nextEl.nextSibling);
+          parent.insertBefore(nextEl.cloneNode(true), item.nextSibling);
+        } else {
+          parent.insertBefore(item, memoEl.nextSibling);
+        }
+        return;
+      }
+      level = parent;
+    }
+  }
+
+  // 로어북 관리 모달 (방 전용)
+  function showLorebookModal(focusIdx = -1) {
+    const roomId = chatRoomId();
+    if (!roomId) return;
+    const lb = roomLorebook(roomId);
+    const entries = (lb.entries || []).map((e) => ({ ...e }));
+    closeNaiModal();
+    const modal = openNaiModal(`
+      <div class="rh-lore-head">
+        <h3 class="rh-import-title" style="margin:0">📖 유저로어북
+          <button type="button" class="rh-help-q" data-lore-help title="설명 보기">?</button>
+        </h3>
+        <label class="rh-lore-toggle" title="이 방에서 로어북 사용">
+          <input type="checkbox" data-lore-field="enabled" ${lb.enabled ? "checked" : ""}>
+          <span class="rh-lore-track"><span class="rh-lore-knob"></span></span>
+          <em>사용</em>
+        </label>
+      </div>
+      <div class="rh-help-pop" data-lore-pop hidden>
+        <button type="button" class="rh-help-x" data-lore-pop-x>✕</button>
+        <strong>이 대화방 전용 로어북</strong><br>
+        키워드(콤마 구분)가 <b>입력·직전 응답</b>에 나오면 내용이 전송에 몰래 첨부돼요.
+        화면·수정창엔 안 보이고, 응답이 오면 자동 삭제.<br>
+        1,500자 여유만큼만 적용(넘치는 로어는 생략) · <b>가중치</b> 높은 순.
+      </div>
+      <div data-lore-list class="rh-lore-list"></div>
+      <div class="rh-nai-modal-actions" style="margin-top:10px">
+        <button type="button" class="rh-btn rh-btn-ghost rh-btn-sm" data-lore-act="add">＋ 추가</button>
+        <span style="flex:1"></span>
+        <button type="button" class="rh-btn" data-lore-act="save">저장</button>
+        <button type="button" class="rh-btn rh-btn-ghost" data-nai-modal="close">닫기</button>
+      </div>
+    `);
+    // [?] 도움말: 데스크톱 호버 + 모바일 클릭(✕로 닫기)
+    const helpBtn = modal.querySelector("[data-lore-help]");
+    const helpPop = modal.querySelector("[data-lore-pop]");
+    let helpSticky = false;
+    helpBtn.addEventListener("mouseenter", () => { helpPop.hidden = false; });
+    helpBtn.addEventListener("mouseleave", () => { if (!helpSticky) helpPop.hidden = true; });
+    helpBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      helpSticky = !helpSticky || helpPop.hidden;
+      helpPop.hidden = !helpSticky;
+    });
+    modal.querySelector("[data-lore-pop-x]").addEventListener("click", () => { helpSticky = false; helpPop.hidden = true; });
+    const listEl = modal.querySelector("[data-lore-list]");
+    const renderList = () => {
+      listEl.innerHTML = entries.length ? entries.map((e, i) => `
+        <div class="rh-lore-item" data-index="${i}">
+          <div class="rh-lore-row1">
+            <input type="text" class="rh-lore-title" data-lore-e="title" value="${esc(e.title || "")}" placeholder="제목" maxlength="50">
+            <label class="rh-lore-prio-wrap" title="가중치 — 높을수록 우선 적용돼요 (기본 0)">가중치
+              <input type="number" class="rh-lore-prio" data-lore-e="priority" value="${Number(e.priority) || 0}" min="0" max="99">
+            </label>
+            <button type="button" class="rh-sc-del" data-lore-act="del" data-index="${i}" title="삭제">✕</button>
+          </div>
+          <input type="text" class="rh-lore-keys" data-lore-e="keywords" value="${esc(e.keywords || "")}" placeholder="키워드 — 콤마로 구분 (예: 마법, 왕궁, 세레나)">
+          <textarea class="rh-lore-content" data-lore-e="content" rows="3" placeholder="키워드가 나오면 전달할 내용">${esc(e.content || "")}</textarea>
+          <p class="rh-lore-count" data-lore-count>&nbsp;</p>
+        </div>`).join("") : `<p class="rh-setting-desc" style="margin:10px 0;text-align:center">아직 로어북이 없어요 — [＋ 추가]로 시작!</p>`;
+      updateCounts();
+    };
+    const collect = () => {
+      listEl.querySelectorAll(".rh-lore-item").forEach((item) => {
+        const i = Number(item.dataset.index);
+        entries[i] = {
+          ...entries[i],
+          priority: Number(item.querySelector("[data-lore-e='priority']").value) || 0,
+          title: item.querySelector("[data-lore-e='title']").value,
+          keywords: item.querySelector("[data-lore-e='keywords']").value,
+          content: item.querySelector("[data-lore-e='content']").value
+        };
+      });
+    };
+    const updateCounts = () => {
+      listEl.querySelectorAll(".rh-lore-item").forEach((item) => {
+        const i = Number(item.dataset.index);
+        const title = item.querySelector("[data-lore-e='title']").value;
+        const content = item.querySelector("[data-lore-e='content']").value;
+        const len = loreBlockOf({ title, content }).length;
+        const p = item.querySelector("[data-lore-count]");
+        p.textContent = `전송 시 ${len}자 차지 ${len > 1300 ? "— ⚠️ 너무 길면 여유가 없어 생략될 수 있어요" : ""}`;
+        p.classList.toggle("rh-lore-over", len > 1300);
+      });
+    };
+    listEl.addEventListener("input", updateCounts);
+    modal.addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-lore-act], [data-nai-modal]");
+      if (!b) return;
+      if (b.dataset.naiModal === "close") { closeNaiModal(); return; }
+      if (b.dataset.loreAct === "add") {
+        collect();
+        entries.push({ id: `lore-${Date.now()}`, priority: 0, title: "", keywords: "", content: "" });
+        renderList();
+      }
+      if (b.dataset.loreAct === "del") {
+        collect();
+        entries.splice(Number(b.dataset.index), 1);
+        renderList();
+      }
+      if (b.dataset.loreAct === "save") {
+        collect();
+        const cleanEntries = entries.filter((x) => String(x.content || "").trim() || String(x.title || "").trim() || String(x.keywords || "").trim());
+        await saveRoomLorebook(roomId, {
+          enabled: modal.querySelector("[data-lore-field='enabled']").checked,
+          entries: cleanEntries
+        });
+        showToast(`로어북 ${cleanEntries.length}개를 저장했어요.`);
+        closeNaiModal();
+      }
+    });
+    renderList();
+    if (focusIdx >= 0) {
+      const target = listEl.querySelector(`.rh-lore-item[data-index="${focusIdx}"]`);
+      if (target) {
+        target.scrollIntoView({ block: "center" });
+        target.classList.add("rh-jump-flash");
+        setTimeout(() => target.classList.remove("rh-jump-flash"), 2000);
+      }
+    }
+  }
+
+  // 로어북 칩 호버 툴팁: 어떤 키워드 때문에 어떤 로어북이 적용되는지
+  let loreTipHideTimer = null;
+
+  function loreHitsLabel(m) {
+    return (m.hits || []).map((h) => `${h.k}(${[h.i ? `입력 ${h.i}` : "", h.o ? `응답 ${h.o}` : ""].filter(Boolean).join("·")})`).join(", ");
+  }
+
+  function showLoreTip(chipEl) {
+    clearTimeout(loreTipHideTimer);
+    const input = findMainChatInput();
+    const { applied, skipped } = loreInjectionPreview(input?.value || "");
+    let tip = $("#rofan-helper-lore-tip");
+    if (!tip) {
+      tip = document.createElement("div");
+      tip.id = "rofan-helper-lore-tip";
+      document.documentElement.append(tip);
+      tip.addEventListener("mouseenter", () => clearTimeout(loreTipHideTimer));
+      tip.addEventListener("mouseleave", () => scheduleLoreTipHide());
+      tip.addEventListener("click", (e) => {
+        const rowEl = e.target.closest("[data-lore-idx]");
+        if (!rowEl) return;
+        tip.hidden = true;
+        showLorebookModal(Number(rowEl.dataset.loreIdx));
+      });
+    }
+    const lbEntries = roomLorebook(chatRoomId()).entries || [];
+    const row = (m, ok) => `
+      <div class="rh-lore-tip-row ${ok ? "" : "rh-skip"}" data-lore-idx="${lbEntries.indexOf(m.entry)}" title="클릭해서 이 로어북 열기">
+        <strong>${esc(m.entry.title || "(제목 없음)")}</strong> <small>${m.block.length}자${ok ? "" : " · 글자수 초과로 생략"}</small>
+        <span>${esc(loreHitsLabel(m))}</span>
+      </div>`;
+    tip.innerHTML = applied.length || skipped.length
+      ? `<p class="rh-lore-tip-head">📖 적용될 로어북</p>` + applied.map((m) => row(m, true)).join("") + skipped.map((m) => row(m, false)).join("")
+      : `<p class="rh-lore-tip-head">지금 조건에 맞는 로어북이 없어요</p><p class="rh-lore-tip-sub">키워드가 입력·직전 응답에 나오면 적용돼요</p>`;
+    const r = chipEl.getBoundingClientRect();
+    tip.style.left = `${Math.max(8, Math.min(window.innerWidth - 300, r.left))}px`;
+    tip.style.bottom = `${Math.max(8, window.innerHeight - r.top + 8)}px`;
+    tip.hidden = false;
+  }
+
+  function scheduleLoreTipHide() {
+    clearTimeout(loreTipHideTimer);
+    loreTipHideTimer = setTimeout(() => { const t = $("#rofan-helper-lore-tip"); if (t) t.hidden = true; }, 250);
+  }
+
+  // 적용 중 로어 확인 모달 (카운터 칩의 '로어북' 클릭)
+  function showAppliedLoreModal() {
+    const input = findMainChatInput();
+    const { applied, skipped, chars } = loreInjectionPreview(input?.value || "");
+    closeNaiModal();
+    const row = (m, ok) => `
+      <div class="rh-lore-applied ${ok ? "" : "rh-lore-skip"}">
+        <strong>${esc(m.entry.title || "(제목 없음)")}</strong>
+        <span>가중치 ${Number(m.entry.priority) || 0} · ${m.block.length}자 ${ok ? "" : "— 글자수 초과로 생략"}</span>
+        <span>매칭: ${esc(loreHitsLabel(m)) || "-"}</span>
+      </div>`;
+    openNaiModal(`
+      <h3 class="rh-import-title">📖 지금 적용될 로어북</h3>
+      <p class="rh-setting-desc">현재 입력과 직전 응답 기준 · 로어 합계 ${chars}자</p>
+      ${applied.length || skipped.length
+        ? applied.map((m) => row(m, true)).join("") + skipped.map((m) => row(m, false)).join("")
+        : `<p class="rh-setting-desc" style="margin:12px 0">지금 조건에 맞는 로어북이 없어요. (키워드가 입력/직전 응답에 나올 때 적용)</p>`}
+      <div class="rh-nai-modal-actions">
+        <button type="button" class="rh-btn rh-btn-ghost rh-btn-sm" data-lore-open>로어북 관리</button>
+        <button type="button" class="rh-btn" data-nai-modal="close">확인</button>
+      </div>
+    `).addEventListener("click", (e) => {
+      if (e.target.closest("[data-nai-modal='close']")) closeNaiModal();
+      if (e.target.closest("[data-lore-open]")) { closeNaiModal(); showLorebookModal(); }
+    });
+  }
+
+  // ===== 단어 치환 (표시 전용) =====
+  // 실제 데이터는 건드리지 않고, 채팅 화면의 텍스트 노드만 바꾼다.
+  // 원본을 WeakMap에 보관해 규칙을 지우거나 끄면 즉시 원래대로 복원된다.
+  const wordSwapOrig = new WeakMap(); // TextNode -> { orig, applied }
+
+  // 치환 대상 루트: 메시지 스크롤 컨테이너(있으면 통째로) → 없으면 15px 본문 블록들
+  function wordSwapRoots() {
+    const rows = collectMessageRows();
+    let el = rows[0];
+    while (el && el !== document.body) {
+      const cs = getComputedStyle(el);
+      if (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > 0) return [el];
+      el = el.parentElement;
+    }
+    return $$("div[style*='font-size: 15px'], div[style*='font-size:15px']").filter((n) => !isHelperElement(n));
+  }
+
+  function applyWordSwap() {
+    if (!/\/chat\//.test(location.pathname)) return;
+    const cfg = state.settings.wordSwap || {};
+    const rules = (Array.isArray(cfg.list) ? cfg.list : []).filter((r) => r && r.from);
+    const enabled = Boolean(cfg.enabled && rules.length);
+    wordSwapRoots().forEach((root) => {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          const parentEl = node.parentElement;
+          if (!parentEl) return NodeFilter.FILTER_REJECT;
+          const tag = parentEl.tagName;
+          if (tag === "SCRIPT" || tag === "STYLE" || tag === "TEXTAREA" || tag === "INPUT") return NodeFilter.FILTER_REJECT;
+          if (isHelperElement(parentEl)) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      let node;
+      while ((node = walker.nextNode())) {
+        let rec = wordSwapOrig.get(node);
+        // 사이트가 노드 내용을 새로 렌더했으면 그것을 새 원본으로 삼는다
+        if (!rec || node.nodeValue !== rec.applied) rec = { orig: node.nodeValue, applied: node.nodeValue };
+        let text = rec.orig;
+        if (enabled) rules.forEach((r) => { text = text.split(r.from).join(r.to ?? ""); });
+        if (node.nodeValue !== text) node.nodeValue = text;
+        rec.applied = text;
+        wordSwapOrig.set(node, rec);
+      }
+    });
+  }
+
+  // ===== 대화 로그 수집 / 검색 / 바로가기 =====
+  // 원문 그대로 저장: 화면에 렌더된 텍스트가 아니라, 사이트가 주고받는 원본 값
+  // (user_chat/char_chat — 마크다운 ** / <html> 등 수정 버튼에서 보이는 값)을 저장한다.
+  // 출처: (a) 채팅 페이지 SSR(__NEXT_DATA__), (b) 지연 로드 API(GetChatLogs 등), (c) 전송(CreateMessage 요청+응답 스트림)
+
+  function storeChatLog(roomId, id, input, output) {
+    if (!roomId || (!input && !output)) return false;
+    const list = state.chatLogs[roomId] || (state.chatLogs[roomId] = []);
+    const key = id ? `id:${id}` : msgKeyOf(roomId, (String(input) + "|" + String(output)).slice(0, 300));
+    const existing = list.find((l) => l.key === key);
+    if (existing) {
+      // 스트림 진행 중 갱신: 더 긴(완성된) 출력으로 교체
+      if (output && String(output).length > String(existing.output || "").length) {
+        existing.output = String(output).slice(0, 20000);
+        return true;
+      }
+      return false;
+    }
+    list.push({ key, input: String(input || "").slice(0, 20000), output: String(output || "").slice(0, 20000), at: nowIso() });
+    if (list.length > 400) state.chatLogs[roomId] = list.slice(-400); // 방당 최근 400턴
+    return true;
+  }
+
+  // 트리에서 원본 대화 로그 객체를 찾는다 (필드명이 버전에 따라 달라 후보를 넓게 본다)
+  function walkRawChatLogs(value, out = []) {
+    if (!value || typeof value !== "object") return out;
+    if (Array.isArray(value)) { value.forEach((v) => walkRawChatLogs(v, out)); return out; }
+    // 대화방(목록) 객체 오인 방지: 방에는 chat_title/chat_count/folder가 있다
+    const isRoomLike = value.chat_title !== undefined || value.chat_count !== undefined || value.folder !== undefined;
+    if (!isRoomLike) {
+      const pick = (keys) => {
+        for (const k of keys) { if (typeof value[k] === "string" && value[k]) return value[k]; }
+        return "";
+      };
+      const input = pick(["user_chat", "userChat", "user_message", "userMessage"]);
+      const output = pick(["char_chat", "bot_chat", "charChat", "botChat", "char_message", "assistant_chat", "ai_chat"]);
+      if (input || output) {
+        out.push({
+          id: firstText(value.id, value.log_id, value.chat_log_id, value.logId),
+          input,
+          output
+        });
+      }
+    }
+    Object.values(value).forEach((v) => { if (v && typeof v === "object") walkRawChatLogs(v, out); });
+    return out;
+  }
+
+  function ingestChatLogsData(data, forceRoomId) {
+    const roomId = (forceRoomId && UUID_RE.test(String(forceRoomId))) ? String(forceRoomId) : chatRoomId();
+    if (!roomId || !data) return;
+    let changed = false;
+    walkRawChatLogs(data).forEach((l) => { if (storeChatLog(roomId, l.id, l.input, l.output)) changed = true; });
+    if (changed) scheduleHookStateSave();
+  }
+
+  // 페이지 SSR에서 1회 수집 (방이 바뀔 때마다)
+  let chatLogPageRoom = "";
+  function captureChatLogsFromDom() {
+    const roomId = chatRoomId();
+    if (!roomId || roomId === chatLogPageRoom) return;
+    chatLogPageRoom = roomId;
+    // SPA 이동 시 __NEXT_DATA__엔 예전 방의 데이터가 남아있다 —
+    // 현재 방 id가 포함된 경우에만 수집해 다른 방 대화 오염을 막는다
+    const raw = document.getElementById("__NEXT_DATA__")?.textContent || "";
+    if (!raw.includes(roomId)) return;
+    ingestChatLogsData(parseNextData());
+  }
+
+  // CreateMessage: 요청의 userChat(원문) + 응답 스트림의 token들을 합쳐 캐릭터 원문 재구성
+  function captureCreateMessageLog(detail) {
+    const roomId = chatRoomId();
+    if (!roomId) return;
+    const req = parseJsonText(detail.reqBody) || {};
+    const input = String(req.userChat || "");
+    const tokens = [];
+    const re = /"token"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+    let m;
+    while ((m = re.exec(String(detail.body || "")))) {
+      try { tokens.push(JSON.parse(`"${m[1]}"`)); } catch {}
+    }
+    let output = tokens.join("");
+    // token 형식이 아니면: 스트림의 각 줄을 JSON으로 파싱해 응답 필드를 찾는다
+    if (!output) {
+      String(detail.body || "").split(/\n+/).forEach((line) => {
+        const j = parseJsonText(line.replace(/^data:\s*/, "").trim());
+        if (j) walkRawChatLogs(j).forEach((l) => { if (l.output && l.output.length > output.length) output = l.output; });
+      });
+    }
+    if (storeChatLog(roomId, "", input, output)) scheduleHookStateSave();
+  }
+
+  // 원문(마크다운/HTML)을 화면 표시 텍스트와 비교 가능한 평문으로
+  function stripRawText(t) {
+    return String(t || "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/[*_~`#>]+/g, "") // 단일 *이탤릭* 등 마크다운 기호 전부 (렌더 텍스트와 일치시키기)
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function normSearchText(t) {
+    return String(t || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  // 대화 맨 처음의 안내 문구("[이 대화는 AI를 통해 생성된 가상의 이야기입니다.]")가 보이면
+  // 처음까지 모두 로드된 것 → 이 방은 지난 대화를 다 확인한 것으로 표시(가져오기 버튼 숨김)
+  function detectFullHistoryLoaded() {
+    const roomId = chatRoomId();
+    if (!roomId || state.rooms[roomId]?.logsImportedAt) return;
+    try {
+      const node = document.evaluate(
+        '//*[contains(text(), "이 대화는 AI를 통해 생성된 가상의 이야기입니다")]',
+        document.body, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+      ).singleNodeValue;
+      if (node && !isHelperElement(node)) {
+        ensureRoom(roomId, { logsImportedAt: nowIso() });
+        scheduleHookStateSave();
+        $("#rofan-helper-chat-search-box .rh-cs-import")?.remove(); // 열려있는 검색창에서도 즉시 제거
+      }
+    } catch {}
+  }
+
+  // R+ 설치 이전의 지난 대화까지 전부 가져오기 (GetChatLogs offset 페이지네이션)
+  let loreImportBusy = false;
+  async function importAllRoomLogs(onDone) {
+    const roomId = chatRoomId();
+    if (!roomId || loreImportBusy) return;
+    loreImportBusy = true;
+    const limit = 50;
+    let offset = 0;
+    let total = 0;
+    try {
+      for (let page = 0; page < 200; page++) {
+        const res = await fetch("/api/chat/GetChatLogs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ chatId: roomId, offset, limit })
+        });
+        if (!res.ok) break;
+        const arr = await res.json();
+        if (!Array.isArray(arr) || !arr.length) break;
+        ingestChatLogsData(arr, roomId);
+        total += arr.length;
+        showToast(`지난 대화 불러오는 중… ${total}개`);
+        if (arr.length < limit) break;
+        offset += arr.length;
+        await new Promise((r) => setTimeout(r, 250)); // 서버 배려
+      }
+      ensureRoom(roomId, { logsImportedAt: nowIso() }); // 완료 표시 → 버튼 숨김
+      await saveState();
+      showToast(`지난 대화 ${total}개 확인 완료 — 검색에 반영됐어요.`);
+    } catch (error) {
+      showToast("지난 대화 불러오기 실패 — 잠시 후 다시 시도해 주세요.");
+      console.warn("[Rofan Helper] importAllRoomLogs", error);
+    } finally {
+      loreImportBusy = false;
+      if (typeof onDone === "function") onDone();
+    }
+  }
+
+  // 대화 위치로 이동 — 화면에 없으면 스크롤 최상단으로 올려 이전 대화를 자동 로드하며 찾는다.
+  async function startChatJump(target) {
+    const needles = (target.needles || [target.needle])
+      .map((n) => normSearchText(n).slice(0, 80))
+      .filter((n) => n.length >= 4);
+    if (!needles.length) return;
+    const findBlock = () => [...new Set(collectMessageRows().map(messageContainerOf).filter(Boolean))]
+      .find((b) => {
+        const text = normSearchText(b.innerText);
+        return needles.some((n) => text.includes(n));
+      });
+    const scrollerOf = () => {
+      let el = collectMessageRows()[0];
+      while (el && el !== document.body) {
+        const cs = getComputedStyle(el);
+        if (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight + 40) return el;
+        el = el.parentElement;
+      }
+      return null;
+    };
+    let stagnant = 0;
+    let prevCount = -1;
+    for (let i = 0; i < 60; i++) {
+      const hit = findBlock();
+      if (hit) {
+        hit.scrollIntoView({ block: "center" });
+        hit.classList.add("rh-jump-flash");
+        setTimeout(() => hit.classList.remove("rh-jump-flash"), 2600);
+        showToast("대화 위치로 이동했어요.");
+        return;
+      }
+      const scroller = scrollerOf();
+      if (!scroller) break;
+      scroller.scrollTop = 0; // 최상단 → 사이트가 이전 대화를 로드
+      showToast(`이전 대화 불러오는 중… (${i + 1})`);
+      await new Promise((r) => setTimeout(r, 1000));
+      const count = collectMessageRows().length;
+      if (count === prevCount) { stagnant += 1; if (stagnant >= 4) break; }
+      else stagnant = 0;
+      prevCount = count;
+    }
+    showToast("대화 위치를 찾지 못했어요. (더 이상 불러올 이전 대화가 없거나 삭제됨)");
+  }
+
+  // 대화방 우측 상단(이미지 버튼 왼쪽)의 검색 버튼 + 검색창
+  function enhanceChatSearchButton() {
+    if (!/\/chat\//.test(location.pathname)) {
+      $("#rofan-helper-chat-search-btn")?.remove();
+      $("#rofan-helper-chat-search-box")?.remove();
+      return;
+    }
+    if ($("#rofan-helper-chat-search-btn")) return;
+    // 화면 상단(90px 이내) 우측 절반의 사이트 버튼 무리에서 가장 왼쪽 버튼을 찾는다
+    const cands = $$("button").filter((b) => {
+      if (isHelperElement(b)) return false;
+      const r = b.getBoundingClientRect();
+      return r.width > 0 && r.top >= 0 && r.top < 90 && r.left > window.innerWidth * 0.5;
+    }).sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+    const anchorBtn = cands[0];
+    const btn = document.createElement("button");
+    btn.id = "rofan-helper-chat-search-btn";
+    btn.type = "button";
+    btn.title = "이 방의 대화 검색";
+    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>`;
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleChatSearchBox(btn);
+    });
+    if (anchorBtn?.parentElement) {
+      anchorBtn.parentElement.insertBefore(btn, anchorBtn); // 이미지/메뉴 버튼 왼쪽에 삽입
+    } else {
+      btn.classList.add("rh-cs-fixed"); // 헤더를 못 찾으면 우측 상단 고정 폴백
+      document.documentElement.append(btn);
+    }
+  }
+
+  function toggleChatSearchBox(btn) {
+    const existing = $("#rofan-helper-chat-search-box");
+    if (existing) { existing.remove(); return; }
+    const box = document.createElement("div");
+    box.id = "rofan-helper-chat-search-box";
+    const alreadyImported = Boolean(state.rooms[chatRoomId()]?.logsImportedAt);
+    box.innerHTML = `
+      <input type="text" placeholder="이 방의 대화 검색…" autocomplete="off">
+      ${alreadyImported ? "" : `<button type="button" class="rh-cs-import" title="R+ 설치 전의 지난 대화까지 전부 가져와 검색에 반영">⬇ 지난 대화 모두 불러오기</button>`}
+      <div class="rh-cs-results"></div>`;
+    document.documentElement.append(box);
+    const r = btn.getBoundingClientRect();
+    box.style.top = `${Math.round(r.bottom + 8)}px`;
+    box.style.right = `${Math.round(Math.max(8, window.innerWidth - r.right - 4))}px`;
+    const input = box.querySelector("input");
+    const results = box.querySelector(".rh-cs-results");
+    const roomId = chatRoomId();
+    const renderRows = (q) => {
+      const query = normSearchText(q);
+      const list = state.chatLogs[roomId] || [];
+      const rows = [];
+      for (let i = list.length - 1; i >= 0 && rows.length < 12; i--) {
+        const log = list[i];
+        if (query && !normSearchText(log.input + " " + log.output).includes(query)) continue;
+        rows.push(log);
+      }
+      results.innerHTML = rows.length ? rows.map((log) => `
+        <button type="button" class="rh-cs-row" data-key="${esc(log.key)}">
+          ${log.input ? `<span class="rh-cs-in">🙋 ${esc(stripRawText(log.input).slice(0, 60))}</span>` : ""}
+          ${log.output ? `<span class="rh-cs-out">💬 ${esc(stripRawText(log.output).slice(0, 70))}</span>` : ""}
+        </button>`).join("") : `<p class="rh-cs-empty">${query ? "검색 결과가 없어요." : "저장된 대화가 없어요."}</p>`;
+    };
+    renderRows("");
+    box.querySelector(".rh-cs-import")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.target.disabled = true;
+      e.target.textContent = "불러오는 중…";
+      importAllRoomLogs(() => {
+        if (document.contains(box)) {
+          e.target.remove(); // 완료된 방은 버튼 제거
+          renderRows(input.value);
+        }
+      });
+    });
+    input.addEventListener("input", () => renderRows(input.value));
+    input.addEventListener("keydown", (e) => { if (e.key === "Escape") box.remove(); });
+    results.addEventListener("click", (e) => {
+      const row = e.target.closest(".rh-cs-row");
+      if (!row) return;
+      const log = (state.chatLogs[roomId] || []).find((l) => l.key === row.dataset.key);
+      box.remove();
+      if (log) startChatJump({ roomId, needles: [stripRawText(log.input || "").slice(0, 120), stripRawText(log.output || "").slice(0, 120)].filter(Boolean) });
+    });
+    setTimeout(() => input.focus(), 50);
+    // 바깥 클릭으로 닫기
+    const closer = (e) => {
+      if (!box.contains(e.target) && e.target !== btn && !btn.contains(e.target)) {
+        box.remove();
+        document.removeEventListener("mousedown", closer, true);
+      }
+    };
+    document.addEventListener("mousedown", closer, true);
+  }
+
+  function jumpToChatLog(roomId, key) {
+    const log = (state.chatLogs[roomId] || []).find((l) => l.key === key);
+    if (!log) return;
+    const target = { roomId, needles: [stripRawText(log.input || "").slice(0, 120), stripRawText(log.output || "").slice(0, 120)].filter(Boolean) };
+    if (chatRoomId() === roomId) {
+      panel.hidden = true;
+      startChatJump(target);
+    } else {
+      // 다른 방: 이동 후 자동으로 찾도록 세션에 기록
+      try { sessionStorage.setItem("rhChatJump", JSON.stringify(target)); } catch {}
+      location.href = `/chat/${roomId}`;
+    }
+  }
+
+  // 페이지 진입 시 대기 중인 바로가기 처리
+  function resumePendingChatJump() {
+    try {
+      const raw = sessionStorage.getItem("rhChatJump");
+      if (!raw) return;
+      const target = JSON.parse(raw);
+      if (target.roomId !== chatRoomId()) return;
+      sessionStorage.removeItem("rhChatJump");
+      setTimeout(() => startChatJump(target), 1500);
+    } catch {}
+  }
+
   // --- 생성 파이프라인 ---
   // 채팅 페이지의 SSR 데이터에서 현재 방의 캐릭터(botId)를 알아낸다.
   // (방 기록에 characterId가 없으면 캐릭터별 외형을 못 불러오는 문제의 해결책)
@@ -3827,6 +4996,34 @@ ${esc(h.aiPrompt)}">
       pushShortcutsConfig();
       renderPanel("chatset");
     }
+    if (action === "regen-presets-save") {
+      const arr = regenPresets().map((v, i) => ($(`[data-field="regen-preset-${i}"]`, panel)?.value ?? v).trim());
+      state.settings.regenPresets = arr;
+      await saveState();
+      renderPanel("chatset");
+      showToast("재생성 지시사항 프리셋을 저장했어요.");
+    }
+    if (action === "wordswap-add") {
+      const from = $(".rh-ws-from", panel)?.value.trim() || "";
+      const to = $(".rh-ws-to", panel)?.value ?? "";
+      if (!from) { showToast("바꿀 단어를 입력해 주세요."); return; }
+      const ws = state.settings.wordSwap || (state.settings.wordSwap = { enabled: false, list: [] });
+      ws.list = Array.isArray(ws.list) ? ws.list : [];
+      const idx = ws.list.findIndex((r) => r.from === from);
+      if (idx >= 0) ws.list[idx] = { from, to }; else ws.list.push({ from, to });
+      await saveState();
+      applyWordSwap();
+      renderPanel("chatset");
+    }
+    if (action === "wordswap-del") {
+      const ws = state.settings.wordSwap || {};
+      if (Array.isArray(ws.list)) {
+        ws.list.splice(Number(button.dataset.index), 1);
+        await saveState();
+        applyWordSwap();
+        renderPanel("chatset");
+      }
+    }
     if (action === "shortcut-del") {
       const i = Number(button.dataset.index);
       const sc = state.settings.shortcuts || {};
@@ -3940,6 +5137,12 @@ ${esc(h.aiPrompt)}">
       renderPanel("chatset");
       showToast(`${IMG_SERVICES[imgSvc()].label} 지시문을 기본값으로 되돌렸어요.`);
     }
+    if (action === "chatlog-jump") jumpToChatLog(button.dataset.room, button.dataset.key);
+    if (action === "chatlog-clear") {
+      state.chatLogs = {};
+      await saveState();
+      renderPanel("data");
+    }
     if (action === "nai-hist-del") {
       state.naiHistory = (state.naiHistory || []).filter((h) => h.id !== button.dataset.id);
       await saveState();
@@ -4003,6 +5206,11 @@ ${esc(h.aiPrompt)}">
     if (field === "import-json") return;
     // 제작자 메모는 입력 중엔 저장하지 않고 [저장] 버튼을 눌러야 저장된다(초안만 유지).
     if (field === "creator-note") return;
+    if (field === "chatlog-search") {
+      const box = $("#rh-chatlog-results", panel);
+      if (box) box.innerHTML = renderChatLogResults(String(value));
+      return;
+    }
     if (field === "chat-fixed-text") {
       // 입력 중에는 미리보기(글자수/경고)만 갱신하고, 실제 저장·전송은 [저장] 버튼에서 처리한다.
       const countEl = $(".rh-setting-count strong", panel);
@@ -4024,6 +5232,11 @@ ${esc(h.aiPrompt)}">
       state.settings.shortcuts = { ...(state.settings.shortcuts || {}), enabled: Boolean(event.target.checked) };
       await saveState();
       pushShortcutsConfig();
+    }
+    if (field === "wordswap-enabled") {
+      state.settings.wordSwap = { ...(state.settings.wordSwap || {}), enabled: Boolean(event.target.checked) };
+      await saveState();
+      applyWordSwap();
     }
     if (field === "shortcut-chips") {
       state.settings.shortcuts = { ...(state.settings.shortcuts || {}), showChips: Boolean(event.target.checked) };
@@ -4235,6 +5448,9 @@ ${esc(h.aiPrompt)}">
     updateChatCounterOffset();
     updateShortcutUI();
     enhanceNaiChatTools();
+    enhanceRerollModal();
+    enhanceLorebookMenuItem();
+    applyWordSwap();
   }
 
   // 캐릭터 상세 페이지의 제작자 링크(<a href="/user/{id}">)를 눌렀을 때
@@ -6891,14 +8107,14 @@ ${esc(h.aiPrompt)}">
 
   function isHelperElementStrict(node) {
     return Boolean(node.closest?.(
-      "#rofan-helper-launcher, #rofan-helper-nav-button, #rofan-helper-list-toolbar, #rofan-helper-panel, #rofan-helper-toast, #rofan-helper-creator-menu, #rofan-helper-chat-counter, #rofan-helper-import-overlay, #rofan-helper-sc-dropdown, #rofan-helper-sc-chips, #rofan-helper-img-tools, #rofan-helper-nai-modal, .rh-nai-msg-btn, .rh-card-info, .rh-card-image-stats, .rh-card-image-host, .rh-inline-new-badge, .rh-modal-average-stat, .rh-modal-refresh-button"
+      "#rofan-helper-launcher, #rofan-helper-nav-button, #rofan-helper-list-toolbar, #rofan-helper-panel, #rofan-helper-toast, #rofan-helper-creator-menu, #rofan-helper-chat-counter, #rofan-helper-import-overlay, #rofan-helper-sc-dropdown, #rofan-helper-sc-chips, #rofan-helper-img-tools, #rofan-helper-nai-modal, #rofan-helper-chat-search-btn, #rofan-helper-chat-search-box, #rofan-helper-regen-btn, #rofan-helper-lore-menu-item, #rofan-helper-lore-tip, .rh-nai-msg-btn, .rh-card-info, .rh-card-image-stats, .rh-card-image-host, .rh-inline-new-badge, .rh-modal-average-stat, .rh-modal-refresh-button"
         + ", #rofan-helper-room-editor, #rofan-helper-room-dialog, #rofan-helper-sticker-toolbar, .rh-room-note-card, .rh-room-note-line, .rh-room-menu-items, .rh-room-avatar, .rh-room-sticker, .rh-room-sticker-overlay, .rh-chat-avatar-button"
     ));
   }
 
   function isHelperElement(node) {
     return isHelperElementStrict(node) || Boolean(node.closest?.(
-      "#rofan-helper-launcher, #rofan-helper-nav-button, #rofan-helper-list-toolbar, #rofan-helper-panel, #rofan-helper-toast, #rofan-helper-creator-menu, #rofan-helper-chat-counter, #rofan-helper-import-overlay, #rofan-helper-sc-dropdown, #rofan-helper-sc-chips, #rofan-helper-img-tools, #rofan-helper-nai-modal, .rh-nai-msg-btn, .rh-card-info, .rh-card-image-stats, .rh-card-image-host, .rh-inline-new-badge, .rh-modal-average-stat, .rh-modal-refresh-button, .rh-card-shell"
+      "#rofan-helper-launcher, #rofan-helper-nav-button, #rofan-helper-list-toolbar, #rofan-helper-panel, #rofan-helper-toast, #rofan-helper-creator-menu, #rofan-helper-chat-counter, #rofan-helper-import-overlay, #rofan-helper-sc-dropdown, #rofan-helper-sc-chips, #rofan-helper-img-tools, #rofan-helper-nai-modal, #rofan-helper-chat-search-btn, #rofan-helper-chat-search-box, #rofan-helper-regen-btn, #rofan-helper-lore-menu-item, #rofan-helper-lore-tip, .rh-nai-msg-btn, .rh-card-info, .rh-card-image-stats, .rh-card-image-host, .rh-inline-new-badge, .rh-modal-average-stat, .rh-modal-refresh-button, .rh-card-shell"
         + ", #rofan-helper-room-editor, #rofan-helper-room-dialog, #rofan-helper-sticker-toolbar, .rh-room-note-card, .rh-room-note-line, .rh-room-menu-items, .rh-room-avatar, .rh-room-sticker, .rh-room-sticker-overlay, .rh-chat-avatar-button"
     ));
   }
@@ -6935,8 +8151,22 @@ ${esc(h.aiPrompt)}">
     // 이미지 고정 토글은 클래스만 바뀌어 MutationObserver(childList/href)가 못 잡는다 —
     // 채팅 페이지에서만 가볍게 주기 점검해 [이미지 변경] 버튼을 제때 붙인다.
     setInterval(() => {
-      if (/\/chat\//.test(location.pathname)) enhanceNaiChatTools();
+      if (/\/chat\//.test(location.pathname)) {
+        enhanceNaiChatTools();
+        captureChatLogsFromDom();
+        enhanceChatSearchButton();
+        enhanceRerollModal();
+        enhanceLorebookMenuItem();
+        pushLorebookConfig();
+        detectFullHistoryLoaded();
+        applyWordSwap();
+        cleanupRegenDom(); // 마커(지시/로어) 잔재 화면 상시 청소
+      } else {
+        $("#rofan-helper-chat-search-btn")?.remove();
+        $("#rofan-helper-chat-search-box")?.remove();
+      }
     }, 900);
+    resumePendingChatJump();
   }
 
   init().catch((error) => console.error("[Rofan Helper] init failed", error));
