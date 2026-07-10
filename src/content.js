@@ -2090,6 +2090,24 @@ ${esc(h.aiPrompt)}">
   }
 
   // 기타설정 탭
+  // 태그 이름 정규화: # 제거·공백 정리·대소문자 무시
+  function normTagName(t) {
+    return String(t || "").replace(/^#/, "").trim().toLowerCase();
+  }
+
+  // 수집된 캐릭터들에서 자주 보이는 태그 (가리기 추천용)
+  function popularTags(limit = 24) {
+    const count = new Map();
+    Object.values(state.characters).forEach((c) => {
+      (c.tags || []).forEach((tag) => {
+        const key = String(tag).replace(/^#/, "").trim();
+        if (!key) return;
+        count.set(key, (count.get(key) || 0) + 1);
+      });
+    });
+    return [...count.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([t]) => t);
+  }
+
   function renderEtcSettings() {
     const fc = state.settings.chatCardFolderColor || {};
     const none = !fc.background && !fc.border;
@@ -2101,6 +2119,23 @@ ${esc(h.aiPrompt)}">
         <button type="button" class="rh-seg-btn${fc.background ? " active" : ""}" data-action="folder-color-mode" data-mode="background">배경</button>
         <button type="button" class="rh-seg-btn${fc.border ? " active" : ""}" data-action="folder-color-mode" data-mode="border">테두리</button>
       </div>
+      <h3>태그 가리기</h3>
+      <p class="rh-setting-desc">등록한 태그가 달린 캐릭터를 <strong>모든 목록(홈·랭킹·신작·검색 등)</strong>에서 가려요. # 유무·대소문자는 구분하지 않아요.</p>
+      <div class="rh-ws-add">
+        <input type="text" class="rh-taghide-input" placeholder="가릴 태그 입력 (예: 집착)" maxlength="30">
+        <button type="button" class="rh-btn rh-btn-sm" data-action="taghide-add">추가</button>
+      </div>
+      <div class="rh-taghide-list">
+        ${(state.settings.hiddenTags || []).length
+          ? (state.settings.hiddenTags || []).map((t, i) => `<span class="rh-taghide-chip">#${esc(String(t).replace(/^#/, ""))}<button type="button" data-action="taghide-del" data-index="${i}" title="해제">✕</button></span>`).join("")
+          : `<p class="rh-setting-desc" style="margin:6px 0">아직 가린 태그가 없어요.</p>`}
+      </div>
+      ${popularTags().length ? `
+      <p class="rh-setting-desc" style="margin-top:10px">자주 보이는 태그 (클릭해서 가리기):</p>
+      <div class="rh-taghide-suggest">
+        ${popularTags().filter((t) => !(state.settings.hiddenTags || []).some((h) => normTagName(h) === normTagName(t)))
+          .map((t) => `<button type="button" class="rh-taghide-sug" data-action="taghide-add-sug" data-tag="${esc(t)}">#${esc(t)}</button>`).join("")}
+      </div>` : ""}
     `;
   }
 
@@ -5003,6 +5038,22 @@ ${esc(h.aiPrompt)}">
       renderPanel("chatset");
       showToast("재생성 지시사항 프리셋을 저장했어요.");
     }
+    if (action === "taghide-add" || action === "taghide-add-sug") {
+      const tag = action === "taghide-add-sug" ? button.dataset.tag : ($(".rh-taghide-input", panel)?.value || "").trim();
+      if (!tag) { showToast("가릴 태그를 입력해 주세요."); return; }
+      const list = state.settings.hiddenTags || (state.settings.hiddenTags = []);
+      if (!list.some((h) => normTagName(h) === normTagName(tag))) list.push(tag.replace(/^#/, ""));
+      await saveState();
+      renderPanel("etc");
+      queueApply(); // 목록 즉시 반영
+      showToast(`#${tag.replace(/^#/, "")} 태그를 가렸어요.`);
+    }
+    if (action === "taghide-del") {
+      (state.settings.hiddenTags || []).splice(Number(button.dataset.index), 1);
+      await saveState();
+      renderPanel("etc");
+      queueApply();
+    }
     if (action === "wordswap-add") {
       const from = $(".rh-ws-from", panel)?.value.trim() || "";
       const to = $(".rh-ws-to", panel)?.value ?? "";
@@ -5512,7 +5563,11 @@ ${esc(h.aiPrompt)}">
       if (char.creatorId && !creatorDisplayName(creator)) queueCreatorLookup(char.creatorId);
       const hiddenByChar = char.hidden;
       const hiddenByCreator = creator.hidden && !revealedCreatorCharacters.has(id);
-      const hiddenByTag = (char.tags || []).some((tag) => state.settings.hiddenTags.includes(tag) || state.settings.excludedGenders.includes(tag));
+      const hiddenByTag = (char.tags || []).some((tag) => {
+        const t = normTagName(tag);
+        return (state.settings.hiddenTags || []).some((h) => normTagName(h) === t)
+          || (state.settings.excludedGenders || []).includes(tag);
+      });
       host.classList.toggle("rh-hidden-card", Boolean(hiddenByChar || hiddenByTag));
       host.classList.toggle("rh-creator-muted", Boolean(hiddenByCreator));
       host.classList.add("rh-enhanced-card");

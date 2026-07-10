@@ -2,12 +2,7 @@
   "manifest_version": 3,
   "name": "Rofan AI Helper",
   "description": "Rofan AI 전용 백업, 메모, 평점, 숨김, 테마, 통계 도우미",
-  "version": "0.30.4",
-  "icons": {
-    "16": "icons/icon-16.png",
-    "48": "icons/icon-48.png",
-    "128": "icons/icon-128.png"
-  },
+  "version": "0.31.0",
   "permissions": [
     "storage",
     "clipboardWrite",
@@ -54,5 +49,10 @@
       ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
 }

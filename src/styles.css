@@ -3561,3 +3561,38 @@ html[data-rofan-helper-theme="midnight"] a {
   margin-bottom: 8px;
 }
 #rofan-helper-chat-search-box .rh-cs-import:disabled { opacity: 0.5; cursor: default; }
+
+/* 태그 가리기 */
+.rh-taghide-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.rh-taghide-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid rgba(255,134,134,0.45);
+  background: rgba(255,110,110,0.1);
+  color: #ff9d9d;
+  border-radius: 999px;
+  padding: 4px 6px 4px 11px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.rh-taghide-chip button {
+  border: none;
+  background: none;
+  color: #ff9d9d;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 1px 3px;
+}
+.rh-taghide-chip button:hover { color: #fff; }
+.rh-taghide-suggest { display: flex; flex-wrap: wrap; gap: 5px; }
+.rh-taghide-sug {
+  border: 1px solid var(--rh-border-strong);
+  background: var(--rh-surface);
+  color: var(--rh-text-dim);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.rh-taghide-sug:hover { border-color: rgba(255,134,134,0.5); color: #ff9d9d; }
